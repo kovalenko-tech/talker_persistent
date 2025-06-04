@@ -1,6 +1,6 @@
 import 'package:hive_ce/hive.dart';
 import 'package:talker/talker.dart';
-import 'package:talker_persistent/src/log_level_adapter.dart';
+import 'package:talker_persistent/src/adapters/log_level.dart';
 
 @HiveType(typeId: 1)
 class TalkerDataPersistent extends HiveObject {

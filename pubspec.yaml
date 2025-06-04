@@ -1,7 +1,9 @@
 name: talker_persistent
-description: A starting point for Dart libraries or applications.
+description: Uma extensão para o pacote talker que adiciona persistência aos logs, permitindo salvar logs tanto em arquivo quanto em banco de dados Hive.
 version: 1.0.0
-# repository: https://github.com/my_org/my_repo
+repository: https://github.com/seu_usuario/talker_persistent
+homepage: https://github.com/seu_usuario/talker_persistent
+issue_tracker: https://github.com/seu_usuario/talker_persistent/issues
 
 environment:
   sdk: ^3.6.0

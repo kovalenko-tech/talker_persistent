@@ -4,7 +4,7 @@ import 'package:collection/collection.dart';
 import 'package:hive_ce/hive.dart';
 import 'package:talker/talker.dart';
 import 'package:talker_persistent/hive/hive_adapters.dart';
-import 'package:talker_persistent/src/talker_data_adapter.dart';
+import 'package:talker_persistent/src/adapters/talker_data.dart';
 
 class TalkerPersistent {
   static TalkerPersistent? _instance;
