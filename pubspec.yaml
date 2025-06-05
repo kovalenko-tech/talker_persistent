@@ -1,6 +1,6 @@
 name: talker_persistent
-description: Uma extensão para o pacote talker que adiciona persistência aos logs, permitindo salvar logs tanto em arquivo quanto em banco de dados Hive.
-version: 1.0.0
+description: An extension for the talker package that adds persistence to logs, allowing you to save logs both to files and Hive database.
+version: 1.0.0+2
 repository: https://github.com/seu_usuario/talker_persistent
 homepage: https://github.com/seu_usuario/talker_persistent
 issue_tracker: https://github.com/seu_usuario/talker_persistent/issues

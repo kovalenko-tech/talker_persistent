@@ -12,6 +12,11 @@ class TalkerPersistentHistory implements TalkerHistory {
   File? _logFile;
   final int maxCapacity;
 
+  int _currentFileLines = 0;
+  static const int _bufferSize = 100;
+  final List<String> _writeBuffer = [];
+  bool _isRotating = false;
+
   /// Creates a new instance of [TalkerPersistentHistory].
   ///
   /// [logName] unique identifier for this history instance.
@@ -33,6 +38,11 @@ class TalkerPersistentHistory implements TalkerHistory {
       final logFilePath = path.join(savePath!, '$logName.log');
       _logFile = File(logFilePath);
       await _logFile!.parent.create(recursive: true);
+      if (await _logFile!.exists()) {
+        // Count initial lines efficiently
+        final contents = await _logFile!.readAsString();
+        _currentFileLines = '\n'.allMatches(contents).length + 1;
+      }
     }
   }
 
@@ -51,9 +61,48 @@ class TalkerPersistentHistory implements TalkerHistory {
     return history;
   }
 
-  /// Disposes of the resources used by this instance.
-  Future<void> dispose() async {
-    _logFile = null;
+  /// Rotates the log file by keeping only the most recent logs
+  Future<void> _rotateLogFile() async {
+    if (_isRotating || _logFile == null) return;
+    _isRotating = true;
+
+    try {
+      if (_currentFileLines > maxCapacity) {
+        final tempFile = File('${_logFile!.path}.tmp');
+        final lines = await _logFile!.readAsLines();
+        final keepLines = lines.skip(lines.length - maxCapacity);
+
+        await tempFile.writeAsString(keepLines.join('\n'));
+        await _logFile!.delete();
+        await tempFile.rename(_logFile!.path);
+
+        _currentFileLines = maxCapacity;
+      }
+    } catch (e) {
+      print('Error rotating log file: $e');
+    } finally {
+      _isRotating = false;
+    }
+  }
+
+  /// Flushes the write buffer to disk
+  Future<void> _flushBuffer() async {
+    if (_writeBuffer.isEmpty || _logFile == null) return;
+
+    try {
+      await _logFile!.writeAsString(
+        '${_writeBuffer.join('\n')}\n',
+        mode: FileMode.append,
+      );
+      _currentFileLines += _writeBuffer.length;
+      _writeBuffer.clear();
+
+      if (_currentFileLines > maxCapacity + _bufferSize) {
+        await _rotateLogFile();
+      }
+    } catch (e) {
+      print('Error flushing log buffer: $e');
+    }
   }
 
   @override
@@ -77,13 +126,24 @@ class TalkerPersistentHistory implements TalkerHistory {
       logName: logName,
       maxCapacity: maxCapacity,
     );
+
     if (_logFile != null) {
       final formattedLog = data.toPrettyString();
       try {
-        _logFile!.writeAsStringSync('$formattedLog\n', mode: FileMode.append);
+        _writeBuffer.add(formattedLog);
+
+        if (_writeBuffer.length >= _bufferSize) {
+          _flushBuffer();
+        }
       } catch (e) {
-        print('Error writing to log file: $e');
+        print('Error buffering log: $e');
       }
     }
+  }
+
+  /// Disposes of the resources used by this instance.
+  Future<void> dispose() async {
+    await _flushBuffer();
+    _logFile = null;
   }
 }
