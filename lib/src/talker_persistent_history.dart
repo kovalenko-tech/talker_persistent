@@ -42,8 +42,11 @@ class TalkerPersistentHistory implements TalkerHistory {
         final logFilePath = path.join(savePath!, '$logName.log');
 
         _logFile = File(logFilePath);
+        final parentDir = _logFile!.parent;
 
-        await _logFile!.parent.create(recursive: true);
+        if (!await parentDir.exists()) {
+          await parentDir.create(recursive: true);
+        }
 
         if (!await _logFile!.exists()) {
           await _logFile!.writeAsString('');
@@ -56,7 +59,7 @@ class TalkerPersistentHistory implements TalkerHistory {
       }
     } catch (e, stack) {
       log('❌ Error initializing log file:');
-      log('Erro: $e');
+      log('Error: $e');
       log('Stack: $stack');
       rethrow;
     }
@@ -106,18 +109,25 @@ class TalkerPersistentHistory implements TalkerHistory {
     if (_writeBuffer.isEmpty || _logFile == null) return;
 
     try {
-      await _logFile!.writeAsString(
-        '${_writeBuffer.join('\n')}\n',
-        mode: FileMode.append,
-      );
+      final content = '${_writeBuffer.join('\n')}\n';
+
+      // Abre o arquivo em modo de escrita
+      final sink = _logFile!.openWrite(mode: FileMode.append);
+      sink.write(content);
+      await sink.flush();
+      await sink.close();
+
       _currentFileLines += _writeBuffer.length;
+
       _writeBuffer.clear();
 
       if (_currentFileLines > maxCapacity + _bufferSize) {
         await _rotateLogFile();
       }
-    } catch (e) {
-      log('Error flushing log buffer: $e');
+    } catch (e, stack) {
+      log('❌ Error writing to log file:');
+      log('Error: $e');
+      log('Stack: $stack');
     }
   }
 
@@ -148,11 +158,12 @@ class TalkerPersistentHistory implements TalkerHistory {
       try {
         _writeBuffer.add(formattedLog);
 
-        if (_writeBuffer.length >= _bufferSize) {
-          _flushBuffer();
-        }
-      } catch (e) {
-        log('Error buffering log: $e');
+        // Força o flush após cada escrita
+        _flushBuffer();
+      } catch (e, stack) {
+        log('❌ Error adding log to buffer:');
+        log('Error: $e');
+        log('Stack: $stack');
       }
     }
   }
