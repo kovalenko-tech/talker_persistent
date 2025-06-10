@@ -1,4 +1,8 @@
-## 1.0.0+2
+## 1.0.0+3
+
+- FIX: write file on windows
+
+## 1.0.0+3
 
 - FIX: recursive save file
 
