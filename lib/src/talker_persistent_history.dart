@@ -1,3 +1,4 @@
+import 'dart:developer';
 import 'dart:io';
 import 'package:talker/talker.dart';
 import 'package:path/path.dart' as path;
@@ -17,6 +18,8 @@ class TalkerPersistentHistory implements TalkerHistory {
   final List<String> _writeBuffer = [];
   bool _isRotating = false;
 
+  /// Private constructor
+
   /// Creates a new instance of [TalkerPersistentHistory].
   ///
   /// [logName] unique identifier for this history instance.
@@ -34,19 +37,32 @@ class TalkerPersistentHistory implements TalkerHistory {
   /// Initializes the persistent storage.
   /// This method must be called before using any other methods.
   Future<void> _initialize() async {
-    if (savePath != null) {
-      final logFilePath = path.join(savePath!, '$logName.log');
-      _logFile = File(logFilePath);
-      await _logFile!.parent.create(recursive: true);
-      if (await _logFile!.exists()) {
-        // Count initial lines efficiently
-        final contents = await _logFile!.readAsString();
-        _currentFileLines = '\n'.allMatches(contents).length + 1;
+    try {
+      if (savePath != null) {
+        final logFilePath = path.join(savePath!, '$logName.log');
+
+        _logFile = File(logFilePath);
+
+        await _logFile!.parent.create(recursive: true);
+
+        if (!await _logFile!.exists()) {
+          await _logFile!.writeAsString('');
+        } else {
+          final contents = await _logFile!.readAsString();
+          _currentFileLines = '\n'.allMatches(contents).length + 1;
+        }
+      } else {
+        log('⚠️ savePath is null, file will not be created');
       }
+    } catch (e, stack) {
+      log('❌ Error initializing log file:');
+      log('Erro: $e');
+      log('Stack: $stack');
+      rethrow;
     }
   }
 
-  /// Creates and initializes a new instance of [TalkerPersistentHistory].
+  /// Creates a new instance of [TalkerPersistentHistory].
   static Future<TalkerPersistentHistory> create({
     required String logName,
     String? savePath,
@@ -79,7 +95,7 @@ class TalkerPersistentHistory implements TalkerHistory {
         _currentFileLines = maxCapacity;
       }
     } catch (e) {
-      print('Error rotating log file: $e');
+      log('Error rotating log file: $e');
     } finally {
       _isRotating = false;
     }
@@ -101,7 +117,7 @@ class TalkerPersistentHistory implements TalkerHistory {
         await _rotateLogFile();
       }
     } catch (e) {
-      print('Error flushing log buffer: $e');
+      log('Error flushing log buffer: $e');
     }
   }
 
@@ -136,7 +152,7 @@ class TalkerPersistentHistory implements TalkerHistory {
           _flushBuffer();
         }
       } catch (e) {
-        print('Error buffering log: $e');
+        log('Error buffering log: $e');
       }
     }
   }
