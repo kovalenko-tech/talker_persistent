@@ -1,23 +1,158 @@
 import 'dart:developer';
 import 'dart:io';
+import 'dart:isolate';
+import 'dart:math' as math;
 import 'package:talker/talker.dart';
 import 'package:path/path.dart' as path;
 import 'package:talker_persistent/src/talker_persistent_service.dart';
 import 'package:talker_persistent/src/pretty_talker.dart';
-import 'dart:math' as math;
+import 'package:hive_ce/hive.dart';
+
+/// Message types for isolate communication
+enum FileOperationType {
+  initialize,
+  write,
+  read,
+  dispose,
+}
+
+/// Message class for isolate communication
+class FileOperationMessage {
+  final FileOperationType type;
+  final String? filePath;
+  final List<String>? logs;
+  final int? maxCapacity;
+  SendPort? responsePort;
+
+  FileOperationMessage({
+    required this.type,
+    this.filePath,
+    this.logs,
+    this.maxCapacity,
+    this.responsePort,
+  });
+}
+
+/// Response class for isolate communication
+class FileOperationResponse {
+  final bool success;
+  final String? error;
+  final int? logCount;
+  final String? content;
+
+  FileOperationResponse({
+    required this.success,
+    this.error,
+    this.logCount,
+    this.content,
+  });
+}
+
+/// Isolate function to handle file operations
+Future<void> _fileOperationsIsolate(SendPort sendPort) async {
+  final receivePort = ReceivePort();
+  sendPort.send(receivePort.sendPort);
+
+  File? logFile;
+  int currentLogCount = 0;
+
+  await for (final message in receivePort) {
+    if (message is FileOperationMessage) {
+      try {
+        switch (message.type) {
+          case FileOperationType.initialize:
+            if (message.filePath != null) {
+              logFile = File(message.filePath!);
+              await logFile.parent.create(recursive: true);
+              if (await logFile.exists()) {
+                final content = await logFile.readAsString();
+                currentLogCount = '┌'.allMatches(content).length;
+              } else {
+                await logFile.writeAsString('');
+                currentLogCount = 0;
+              }
+            }
+            message.responsePort?.send(FileOperationResponse(success: true, logCount: currentLogCount));
+
+          case FileOperationType.write:
+            if (logFile != null && message.logs != null) {
+              final content = '${message.logs!.join('\n')}\n';
+              final newLogCount = '┌'.allMatches(content).length;
+
+              if (message.maxCapacity != null) {
+                final fileContent = await logFile.readAsString();
+                final lines = fileContent.split('\n');
+                final logs = <String>[];
+                var currentLog = <String>[];
+                var foundLog = false;
+
+                for (var line in lines) {
+                  if (line.contains('┌')) {
+                    if (foundLog) {
+                      logs.add(currentLog.join('\n'));
+                    }
+                    currentLog = [line];
+                    foundLog = true;
+                  } else if (foundLog) {
+                    currentLog.add(line);
+                  }
+                }
+                if (foundLog) {
+                  logs.add(currentLog.join('\n'));
+                }
+
+                logs.addAll(message.logs!);
+
+                final keepLogs = logs.skip(logs.length - message.maxCapacity!).toList();
+
+                await logFile.writeAsString('${keepLogs.join('\n')}\n');
+                currentLogCount = keepLogs.length;
+              } else {
+                await logFile.writeAsString(content, mode: FileMode.append);
+                currentLogCount += newLogCount;
+              }
+            }
+            message.responsePort?.send(FileOperationResponse(success: true, logCount: currentLogCount));
+
+          case FileOperationType.read:
+            if (logFile != null) {
+              final content = await logFile.readAsString();
+              currentLogCount = '┌'.allMatches(content).length;
+              message.responsePort?.send(FileOperationResponse(
+                success: true,
+                content: content,
+                logCount: currentLogCount,
+              ));
+            }
+
+          case FileOperationType.dispose:
+            logFile = null;
+            currentLogCount = 0;
+            message.responsePort?.send(FileOperationResponse(success: true));
+            break;
+        }
+      } catch (e, stack) {
+        message.responsePort?.send(FileOperationResponse(
+          success: false,
+          error: 'Error: $e\nStack: $stack',
+        ));
+      }
+    }
+  }
+}
 
 /// A persistent implementation of [TalkerHistory] that stores logs on disk using Hive.
 /// This implementation works for both Dart and Flutter applications.
 class TalkerPersistentHistory implements TalkerHistory {
   final String logName;
   final String? savePath;
-  File? _logFile;
   final int maxCapacity;
-
-  int _currentFileLines = 0;
-  static const int _bufferSize = 100;
+  final int _bufferSize = 100;
   final List<String> _writeBuffer = [];
-  bool _isRotating = false;
+  Isolate? _isolate;
+  SendPort? _sendPort;
+  ReceivePort? _receivePort;
+  bool _isInitialized = false;
 
   /// Private constructor
 
@@ -31,9 +166,7 @@ class TalkerPersistentHistory implements TalkerHistory {
     required this.logName,
     this.savePath,
     this.maxCapacity = 1000,
-  }) {
-    _initialize();
-  }
+  });
 
   /// Initializes the persistent storage.
   /// This method must be called before using any other methods.
@@ -41,19 +174,30 @@ class TalkerPersistentHistory implements TalkerHistory {
     try {
       if (savePath != null) {
         final logFilePath = path.join(savePath!, '$logName.log');
+        log('📝 Initializing log file at: $logFilePath');
 
-        _logFile = File(logFilePath);
-        final parentDir = _logFile!.parent;
+        if (!_isInitialized) {
+          _receivePort = ReceivePort();
+          _isolate = await Isolate.spawn(
+            _fileOperationsIsolate,
+            _receivePort!.sendPort,
+          );
 
-        if (!await parentDir.exists()) {
-          await parentDir.create(recursive: true);
-        }
+          final sendPort = await _receivePort!.first as SendPort;
+          _sendPort = sendPort;
 
-        if (!await _logFile!.exists()) {
-          await _logFile!.writeAsString('');
+          final response = await _sendMessage(FileOperationMessage(
+            type: FileOperationType.initialize,
+            filePath: logFilePath,
+          ));
+
+          if (!response.success) {
+            throw Exception(response.error);
+          }
+
+          _isInitialized = true;
         } else {
-          final contents = await _logFile!.readAsString();
-          _currentFileLines = '\n'.allMatches(contents).length + 1;
+          log('⚠️ TalkerPersistentHistory já está inicializado');
         }
       } else {
         log('⚠️ savePath is null, file will not be created');
@@ -83,99 +227,77 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Rotates the log file by keeping only the most recent logs
   Future<void> _rotateLogFile() async {
-    if (_isRotating || _logFile == null) return;
-    _isRotating = true;
+    if (_receivePort == null) return;
 
     try {
-      final content = await _logFile!.readAsString();
-      final logCount = '┌'.allMatches(content).length;
+      final response = await _sendMessage(FileOperationMessage(
+        type: FileOperationType.read,
+      ));
 
-      if (logCount > maxCapacity) {
-        log('🔄 Rotating log file - current logs: $logCount, max capacity: $maxCapacity');
+      if (response.success && response.content != null) {
+        final content = response.content!;
+        final logCount = '┌'.allMatches(content).length;
 
-        final lines = content.split('\n');
-        final logs = <String>[];
-        var currentLog = <String>[];
-        var foundLog = false;
+        if (logCount > maxCapacity) {
+          final lines = content.split('\n');
+          final logs = <String>[];
+          var currentLog = <String>[];
+          var foundLog = false;
 
-        // Process each line to group logs
-        for (var line in lines) {
-          if (line.contains('┌')) {
-            if (foundLog) {
-              logs.add(currentLog.join('\n'));
+          for (var line in lines) {
+            if (line.contains('┌')) {
+              if (foundLog) {
+                logs.add(currentLog.join('\n'));
+              }
+              currentLog = [line];
+              foundLog = true;
+            } else if (foundLog) {
+              currentLog.add(line);
             }
-            currentLog = [line];
-            foundLog = true;
-          } else if (foundLog) {
-            currentLog.add(line);
           }
+          if (foundLog) {
+            logs.add(currentLog.join('\n'));
+          }
+
+          final keepLogs = logs.skip(logs.length - maxCapacity).toList();
+
+          await _sendMessage(FileOperationMessage(
+            type: FileOperationType.write,
+            logs: keepLogs,
+            maxCapacity: maxCapacity,
+          ));
+
+          log('📊 Log file rotated - new log count: $logCount');
         }
-        if (foundLog) {
-          logs.add(currentLog.join('\n'));
-        }
-
-        // Keep only the most recent logs
-        final keepLogs = logs.skip(logs.length - maxCapacity).toList();
-
-        // Write back to file
-        await _logFile!.writeAsString('${keepLogs.join('\n')}\n');
-        _currentFileLines = keepLogs.length;
-
-        log('📊 Log file rotated - new log count: $_currentFileLines');
       }
     } catch (e, stack) {
       log('❌ Error rotating log file:');
       log('Error: $e');
       log('Stack: $stack');
-    } finally {
-      _isRotating = false;
     }
   }
 
   /// Flushes the write buffer to disk
   Future<void> _flushBuffer() async {
-    if (_writeBuffer.isEmpty || _logFile == null) return;
+    if (_writeBuffer.isEmpty || !_isInitialized) return;
 
     try {
-      final content = '${_writeBuffer.join('\n')}\n';
+      final response = await _sendMessage(FileOperationMessage(
+        type: FileOperationType.write,
+        logs: _writeBuffer,
+        maxCapacity: maxCapacity,
+      ));
 
-      // Check current log count
-      final currentContent = await _logFile!.readAsString();
-      final currentLogCount = '┌'.allMatches(currentContent).length;
-      final newLogCount = '┌'.allMatches(content).length;
-
-      if (currentLogCount + newLogCount > maxCapacity) {
-        log('🔄 Rotating logs - current: $currentLogCount, adding: $newLogCount, max: $maxCapacity');
-        await _rotateLogFile();
+      if (!response.success) {
+        throw Exception(response.error);
       }
 
-      // Open file in write mode
-      final sink = _logFile!.openWrite(mode: FileMode.append);
-      sink.write(content);
-      await sink.flush();
-      await sink.close();
-
-      _currentFileLines = '┌'.allMatches(await _logFile!.readAsString()).length;
       _writeBuffer.clear();
     } catch (e, stack) {
       log('❌ Error writing to log file:');
       log('Error: $e');
       log('Stack: $stack');
     }
-  }
-
-  @override
-  void clean() {
-    TalkerPersistent.instance.clean(logName: logName);
-    if (savePath != null) {
-      final logFilePath = path.join(savePath!, '$logName.log');
-      File(logFilePath).writeAsStringSync('');
-    }
-  }
-
-  @override
-  List<TalkerData> get history {
-    return List.unmodifiable(TalkerPersistent.instance.getLogs(logName: logName));
   }
 
   @override
@@ -186,16 +308,16 @@ class TalkerPersistentHistory implements TalkerHistory {
       maxCapacity: maxCapacity,
     );
 
-    if (_logFile != null) {
+    if (_isInitialized) {
       final formattedLog = data.toPrettyString();
       try {
         log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
         _writeBuffer.add(formattedLog);
 
-        // Only flush if buffer is full
         if (_writeBuffer.length >= _bufferSize) {
           log('🔄 Buffer full, initiating flush');
           _flushBuffer();
+          _rotateLogFile();
         }
       } catch (e, stack) {
         log('❌ Error adding log to buffer:');
@@ -205,17 +327,62 @@ class TalkerPersistentHistory implements TalkerHistory {
     }
   }
 
+  @override
+  void clean() {
+    TalkerPersistent.instance.clean(logName: logName);
+  }
+
+  @override
+  List<TalkerData> get history {
+    return List.unmodifiable(TalkerPersistent.instance.getLogs(logName: logName));
+  }
+
   /// Disposes of the resources used by this instance.
   Future<void> dispose() async {
     log('🔄 Finalizing TalkerPersistentHistory...');
 
-    // Ensure any remaining logs in buffer are written
-    if (_writeBuffer.isNotEmpty) {
-      log('📝 Writing remaining ${_writeBuffer.length} logs from buffer');
-      await _flushBuffer();
+    if (_isInitialized) {
+      if (_writeBuffer.isNotEmpty) {
+        log('📝 Writing remaining ${_writeBuffer.length} logs from buffer');
+        await _flushBuffer();
+      }
+
+      await _sendMessage(FileOperationMessage(
+        type: FileOperationType.dispose,
+      ));
+
+      _isolate?.kill();
+      _receivePort?.close();
+      _isInitialized = false;
+
+      // Fecha o Hive
+      try {
+        await Hive.close();
+        log('✅ Hive fechado com sucesso');
+      } catch (e, stack) {
+        log('❌ Erro ao fechar o Hive:');
+        log('Error: $e');
+        log('Stack: $stack');
+      }
     }
 
-    _logFile = null;
     log('✅ TalkerPersistentHistory finalized');
+  }
+
+  Future<FileOperationResponse> _sendMessage(FileOperationMessage message) async {
+    if (_sendPort == null) {
+      throw Exception('Isolate not initialized');
+    }
+
+    final responsePort = ReceivePort();
+    message.responsePort = responsePort.sendPort;
+    _sendPort!.send(message);
+
+    try {
+      final response = await responsePort.first as FileOperationResponse;
+      return response;
+    } finally {
+      responsePort.close();
+    }
   }
 }

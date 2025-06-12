@@ -34,6 +34,7 @@ class MyHomePage extends StatefulWidget {
 
 class _MyHomePageState extends State<MyHomePage> {
   final int _counter = 0;
+  TalkerPersistentHistory? _history;
 
   Future<void> _incrementCounter() async {
     try {
@@ -71,17 +72,18 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // Initialize Talker with persistent history
       log('🔄 Iniciando TalkerPersistentHistory...');
-      final history = await TalkerPersistentHistory.create(
+      _history = await TalkerPersistentHistory.create(
         logName: 'biel',
         savePath: logsPath,
-        maxCapacity: 100,
+        maxCapacity: 3,
       );
       log('✅ TalkerPersistentHistory inicializado');
 
       final talker = Talker(
-        history: history,
+        history: _history,
         settings: TalkerSettings(
           useHistory: true,
+          maxHistoryItems: 3,
         ),
       );
 
@@ -93,7 +95,7 @@ class _MyHomePageState extends State<MyHomePage> {
 
       // Test history retrieval
       log('\nCurrent history:');
-      for (final logr in history.history) {
+      for (final logr in _history!.history) {
         log('- ${logr.displayMessage}');
       }
 
@@ -113,14 +115,22 @@ class _MyHomePageState extends State<MyHomePage> {
         log('Verifique se você tem permissões para acessar o diretório.');
       }
 
-      // Clean up
-      // await history.dispose();
-
       log('\n✨ Exemplo finalizado com sucesso!');
     } catch (e, stack) {
       log('Error running example: $e');
       log('Stack trace: $stack');
       rethrow;
+    }
+  }
+
+  Future<void> _disposeHistory() async {
+    if (_history != null) {
+      log('🔄 Iniciando dispose do TalkerPersistentHistory...');
+      await _history!.dispose();
+      _history = null;
+      log('✅ TalkerPersistentHistory finalizado');
+    } else {
+      log('⚠️ TalkerPersistentHistory não está inicializado');
     }
   }
 
@@ -131,7 +141,12 @@ class _MyHomePageState extends State<MyHomePage> {
       body: Center(
           child: Column(mainAxisAlignment: MainAxisAlignment.center, children: <Widget>[
         const Text('You have pushed the button this many times:'),
-        Text('$_counter', style: Theme.of(context).textTheme.headlineMedium)
+        Text('$_counter', style: Theme.of(context).textTheme.headlineMedium),
+        const SizedBox(height: 20),
+        ElevatedButton(
+          onPressed: _disposeHistory,
+          child: const Text('Dispose History'),
+        ),
       ])),
       floatingActionButton: FloatingActionButton(onPressed: _incrementCounter, tooltip: 'Increment', child: const Icon(Icons.add)),
     );

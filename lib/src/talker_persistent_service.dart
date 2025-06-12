@@ -76,4 +76,19 @@ class TalkerPersistent {
   List<TalkerData> getLogs({required String logName}) {
     return _logs[logName]?.map((e) => e.toTalkerData()).toList() ?? [];
   }
+
+  Future<void> dispose() async {
+    if (_isInitialized) {
+      try {
+        await _box?.close();
+        _box = null;
+        _isInitialized = false;
+        _logs.clear();
+      } catch (e, stack) {
+        print('Error disposing TalkerPersistent: $e');
+        print('Stack: $stack');
+        rethrow;
+      }
+    }
+  }
 }
