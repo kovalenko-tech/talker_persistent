@@ -4,6 +4,7 @@ import 'package:talker/talker.dart';
 import 'package:path/path.dart' as path;
 import 'package:talker_persistent/src/talker_persistent_service.dart';
 import 'package:talker_persistent/src/pretty_talker.dart';
+import 'dart:math' as math;
 
 /// A persistent implementation of [TalkerHistory] that stores logs on disk using Hive.
 /// This implementation works for both Dart and Flutter applications.
@@ -86,19 +87,46 @@ class TalkerPersistentHistory implements TalkerHistory {
     _isRotating = true;
 
     try {
-      if (_currentFileLines > maxCapacity) {
-        final tempFile = File('${_logFile!.path}.tmp');
-        final lines = await _logFile!.readAsLines();
-        final keepLines = lines.skip(lines.length - maxCapacity);
+      final content = await _logFile!.readAsString();
+      final logCount = '┌'.allMatches(content).length;
 
-        await tempFile.writeAsString(keepLines.join('\n'));
-        await _logFile!.delete();
-        await tempFile.rename(_logFile!.path);
+      if (logCount > maxCapacity) {
+        log('🔄 Rotating log file - current logs: $logCount, max capacity: $maxCapacity');
 
-        _currentFileLines = maxCapacity;
+        final lines = content.split('\n');
+        final logs = <String>[];
+        var currentLog = <String>[];
+        var foundLog = false;
+
+        // Process each line to group logs
+        for (var line in lines) {
+          if (line.contains('┌')) {
+            if (foundLog) {
+              logs.add(currentLog.join('\n'));
+            }
+            currentLog = [line];
+            foundLog = true;
+          } else if (foundLog) {
+            currentLog.add(line);
+          }
+        }
+        if (foundLog) {
+          logs.add(currentLog.join('\n'));
+        }
+
+        // Keep only the most recent logs
+        final keepLogs = logs.skip(logs.length - maxCapacity).toList();
+
+        // Write back to file
+        await _logFile!.writeAsString('${keepLogs.join('\n')}\n');
+        _currentFileLines = keepLogs.length;
+
+        log('📊 Log file rotated - new log count: $_currentFileLines');
       }
-    } catch (e) {
-      log('Error rotating log file: $e');
+    } catch (e, stack) {
+      log('❌ Error rotating log file:');
+      log('Error: $e');
+      log('Stack: $stack');
     } finally {
       _isRotating = false;
     }
@@ -111,19 +139,24 @@ class TalkerPersistentHistory implements TalkerHistory {
     try {
       final content = '${_writeBuffer.join('\n')}\n';
 
-      // Abre o arquivo em modo de escrita
+      // Check current log count
+      final currentContent = await _logFile!.readAsString();
+      final currentLogCount = '┌'.allMatches(currentContent).length;
+      final newLogCount = '┌'.allMatches(content).length;
+
+      if (currentLogCount + newLogCount > maxCapacity) {
+        log('🔄 Rotating logs - current: $currentLogCount, adding: $newLogCount, max: $maxCapacity');
+        await _rotateLogFile();
+      }
+
+      // Open file in write mode
       final sink = _logFile!.openWrite(mode: FileMode.append);
       sink.write(content);
       await sink.flush();
       await sink.close();
 
-      _currentFileLines += _writeBuffer.length;
-
+      _currentFileLines = '┌'.allMatches(await _logFile!.readAsString()).length;
       _writeBuffer.clear();
-
-      if (_currentFileLines > maxCapacity + _bufferSize) {
-        await _rotateLogFile();
-      }
     } catch (e, stack) {
       log('❌ Error writing to log file:');
       log('Error: $e');
@@ -156,10 +189,14 @@ class TalkerPersistentHistory implements TalkerHistory {
     if (_logFile != null) {
       final formattedLog = data.toPrettyString();
       try {
+        log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
         _writeBuffer.add(formattedLog);
 
-        // Força o flush após cada escrita
-        _flushBuffer();
+        // Only flush if buffer is full
+        if (_writeBuffer.length >= _bufferSize) {
+          log('🔄 Buffer full, initiating flush');
+          _flushBuffer();
+        }
       } catch (e, stack) {
         log('❌ Error adding log to buffer:');
         log('Error: $e');
@@ -170,7 +207,15 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Disposes of the resources used by this instance.
   Future<void> dispose() async {
-    await _flushBuffer();
+    log('🔄 Finalizing TalkerPersistentHistory...');
+
+    // Ensure any remaining logs in buffer are written
+    if (_writeBuffer.isNotEmpty) {
+      log('📝 Writing remaining ${_writeBuffer.length} logs from buffer');
+      await _flushBuffer();
+    }
+
     _logFile = null;
+    log('✅ TalkerPersistentHistory finalized');
   }
 }
