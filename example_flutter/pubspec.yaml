@@ -16,7 +16,7 @@ dependencies:
   path: any
   talker_persistent:
     git: https://github.com/eduardohr-muniz/talker_persistent
-
+  #teste
   cupertino_icons: ^1.0.8
 
 dev_dependencies:
