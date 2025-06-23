@@ -15,7 +15,7 @@ dependencies:
   path_provider: any
   path: any
   talker_persistent:
-    path: ../
+    git: https://github.com/eduardohr-muniz/talker_persistent
 
   cupertino_icons: ^1.0.8
 
