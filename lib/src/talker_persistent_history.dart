@@ -103,7 +103,8 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
 
                 logs.addAll(message.logs!);
 
-                final keepLogs = logs.skip(logs.length - message.maxCapacity!).toList();
+                final skipCount = math.max(0, logs.length - message.maxCapacity!);
+                final keepLogs = logs.skip(skipCount).toList();
 
                 await logFile.writeAsString('${keepLogs.join('\n')}\n');
                 currentLogCount = keepLogs.length;
@@ -259,7 +260,8 @@ class TalkerPersistentHistory implements TalkerHistory {
             logs.add(currentLog.join('\n'));
           }
 
-          final keepLogs = logs.skip(logs.length - maxCapacity).toList();
+          final skipCount = math.max(0, logs.length - maxCapacity);
+          final keepLogs = logs.skip(skipCount).toList();
 
           await _sendMessage(FileOperationMessage(
             type: FileOperationType.write,
