@@ -142,40 +142,67 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
   }
 }
 
+/// Configuration class for TalkerPersistentHistory
+class TalkerPersistentConfig {
+  /// Buffer size for logs. If 0, logs are written immediately (real-time).
+  /// If > 0, logs are buffered and written when buffer is full.
+  final int bufferSize;
+
+  /// Whether to flush immediately for error and critical logs
+  final bool flushOnError;
+
+  /// Maximum capacity of logs to keep
+  final int maxCapacity;
+
+  /// Whether to enable file logging
+  final bool enableFileLogging;
+
+  /// Whether to enable Hive database logging
+  final bool enableHiveLogging;
+
+  const TalkerPersistentConfig({
+    this.bufferSize = 100,
+    this.flushOnError = true,
+    this.maxCapacity = 1000,
+    this.enableFileLogging = true,
+    this.enableHiveLogging = true,
+  });
+}
+
 /// A persistent implementation of [TalkerHistory] that stores logs on disk using Hive.
 /// This implementation works for both Dart and Flutter applications.
 class TalkerPersistentHistory implements TalkerHistory {
   final String logName;
   final String? savePath;
-  final int maxCapacity;
-  final int _bufferSize = 100;
+  final TalkerPersistentConfig config;
+
   final List<String> _writeBuffer = [];
   Isolate? _isolate;
   SendPort? _sendPort;
   ReceivePort? _receivePort;
   bool _isInitialized = false;
 
-  /// Private constructor
-
   /// Creates a new instance of [TalkerPersistentHistory].
   ///
   /// [logName] unique identifier for this history instance.
   /// [savePath] optional path to save logs to a file. If provided, logs will be written to both Hive and the file.
-  /// [maxCapacity] defines the maximum number of logs to keep in history.
-  /// When the capacity is reached, older logs will be removed.
+  /// [config] configuration for the persistent history behavior.
   TalkerPersistentHistory({
     required this.logName,
     this.savePath,
-    this.maxCapacity = 1000,
-  });
+    TalkerPersistentConfig? config,
+  }) : config = config ?? const TalkerPersistentConfig();
 
   /// Initializes the persistent storage.
   /// This method must be called before using any other methods.
   Future<void> _initialize() async {
     try {
-      if (savePath != null) {
+      if (savePath != null && config.enableFileLogging) {
         final logFilePath = path.join(savePath!, '$logName.log');
         log('📝 Initializing log file at: $logFilePath');
+        log('📊 Buffer size: ${config.bufferSize} (${config.bufferSize == 0 ? 'real-time' : 'buffered'})');
+        log('🚨 Flush on error: ${config.flushOnError}');
+        log('💾 Max capacity: ${config.maxCapacity}');
 
         if (!_isInitialized) {
           _receivePort = ReceivePort();
@@ -201,7 +228,12 @@ class TalkerPersistentHistory implements TalkerHistory {
           log('⚠️ TalkerPersistentHistory já está inicializado');
         }
       } else {
-        log('⚠️ savePath is null, file will not be created');
+        if (savePath == null) {
+          log('⚠️ savePath is null, file logging disabled');
+        }
+        if (!config.enableFileLogging) {
+          log('⚠️ File logging disabled in config');
+        }
       }
     } catch (e, stack) {
       log('❌ Error initializing log file:');
@@ -215,12 +247,12 @@ class TalkerPersistentHistory implements TalkerHistory {
   static Future<TalkerPersistentHistory> create({
     required String logName,
     String? savePath,
-    int maxCapacity = 1000,
+    TalkerPersistentConfig? config,
   }) async {
     final history = TalkerPersistentHistory(
       logName: logName,
       savePath: savePath,
-      maxCapacity: maxCapacity,
+      config: config,
     );
     await history._initialize();
     return history;
@@ -228,7 +260,7 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Rotates the log file by keeping only the most recent logs
   Future<void> _rotateLogFile() async {
-    if (_receivePort == null) return;
+    if (_receivePort == null || !config.enableFileLogging) return;
 
     try {
       final response = await _sendMessage(FileOperationMessage(
@@ -239,7 +271,7 @@ class TalkerPersistentHistory implements TalkerHistory {
         final content = response.content!;
         final logCount = '┌'.allMatches(content).length;
 
-        if (logCount > maxCapacity) {
+        if (logCount > config.maxCapacity) {
           final lines = content.split('\n');
           final logs = <String>[];
           var currentLog = <String>[];
@@ -260,13 +292,13 @@ class TalkerPersistentHistory implements TalkerHistory {
             logs.add(currentLog.join('\n'));
           }
 
-          final skipCount = math.max(0, logs.length - maxCapacity);
+          final skipCount = math.max(0, logs.length - config.maxCapacity);
           final keepLogs = logs.skip(skipCount).toList();
 
           await _sendMessage(FileOperationMessage(
             type: FileOperationType.write,
             logs: keepLogs,
-            maxCapacity: maxCapacity,
+            maxCapacity: config.maxCapacity,
           ));
 
           log('📊 Log file rotated - new log count: $logCount');
@@ -281,13 +313,13 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Flushes the write buffer to disk
   Future<void> _flushBuffer() async {
-    if (_writeBuffer.isEmpty || !_isInitialized) return;
+    if (_writeBuffer.isEmpty || !_isInitialized || !config.enableFileLogging) return;
 
     try {
       final response = await _sendMessage(FileOperationMessage(
         type: FileOperationType.write,
         logs: _writeBuffer,
-        maxCapacity: maxCapacity,
+        maxCapacity: config.maxCapacity,
       ));
 
       if (!response.success) {
@@ -302,22 +334,42 @@ class TalkerPersistentHistory implements TalkerHistory {
     }
   }
 
+  /// Checks if a log level requires immediate flush
+  bool _shouldFlushImmediately(TalkerData data) {
+    if (!config.flushOnError) return false;
+    return data.logLevel == LogLevel.error || data.logLevel == LogLevel.critical;
+  }
+
   @override
   void write(TalkerData data) {
-    TalkerPersistent.instance.write(
-      data: data,
-      logName: logName,
-      maxCapacity: maxCapacity,
-    );
+    // Write to Hive if enabled
+    if (config.enableHiveLogging) {
+      TalkerPersistent.instance.write(
+        data: data,
+        logName: logName,
+        maxCapacity: config.maxCapacity,
+      );
+    }
 
-    if (_isInitialized) {
+    // Write to file if enabled
+    if (_isInitialized && config.enableFileLogging) {
       final formattedLog = data.toPrettyString();
       try {
         log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
         _writeBuffer.add(formattedLog);
 
-        if (_writeBuffer.length >= _bufferSize) {
-          log('🔄 Buffer full, initiating flush');
+        // Check if we should flush immediately
+        final shouldFlush = config.bufferSize == 0 || // Real-time mode
+            _shouldFlushImmediately(data) || // Error/critical logs
+            _writeBuffer.length >= config.bufferSize; // Buffer full
+
+        if (shouldFlush) {
+          final reason = config.bufferSize == 0
+              ? 'real-time mode'
+              : _shouldFlushImmediately(data)
+                  ? 'error/critical log'
+                  : 'buffer full';
+          log('🔄 Flushing buffer ($reason)');
           _flushBuffer();
           _rotateLogFile();
         }
@@ -331,11 +383,14 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   @override
   void clean() {
-    TalkerPersistent.instance.clean(logName: logName);
+    if (config.enableHiveLogging) {
+      TalkerPersistent.instance.clean(logName: logName);
+    }
   }
 
   @override
   List<TalkerData> get history {
+    if (!config.enableHiveLogging) return [];
     return List.unmodifiable(TalkerPersistent.instance.getLogs(logName: logName));
   }
 
@@ -343,7 +398,7 @@ class TalkerPersistentHistory implements TalkerHistory {
   Future<void> dispose() async {
     log('🔄 Finalizing TalkerPersistentHistory...');
 
-    if (_isInitialized) {
+    if (_isInitialized && config.enableFileLogging) {
       if (_writeBuffer.isNotEmpty) {
         log('📝 Writing remaining ${_writeBuffer.length} logs from buffer');
         await _flushBuffer();
@@ -356,8 +411,10 @@ class TalkerPersistentHistory implements TalkerHistory {
       _isolate?.kill();
       _receivePort?.close();
       _isInitialized = false;
+    }
 
-      // Fecha o Hive
+    // Fecha o Hive se estiver habilitado
+    if (config.enableHiveLogging) {
       try {
         await Hive.close();
         log('✅ Hive fechado com sucesso');
