@@ -13,6 +13,10 @@ void main() async {
   // Exemplo 3: Configuração personalizada
   print('\n=== Exemplo 3: Configuração personalizada ===');
   await exemploConfiguracaoPersonalizada();
+
+  // Exemplo 4: Salvar todos os logs do dia
+  print('\n=== Exemplo 4: Salvar todos os logs do dia ===');
+  await exemploSaveAllLogs();
 }
 
 /// Exemplo com buffer padrão (100 logs)
@@ -23,6 +27,7 @@ Future<void> exemploComBuffer() async {
     maxCapacity: 1000, // Máximo de 1000 logs
     enableFileLogging: true,
     enableHiveLogging: true,
+    logRetentionPeriod: LogRetentionPeriod.threeDays,
   );
 
   final history = await TalkerPersistentHistory.create(
@@ -118,6 +123,50 @@ Future<void> exemploConfiguracaoPersonalizada() async {
   await history.dispose();
 }
 
+/// Exemplo de salvar todos os logs do dia
+Future<void> exemploSaveAllLogs() async {
+  final config = TalkerPersistentConfig(
+    bufferSize: 0, // Tempo real para garantir que todos os logs sejam salvos
+    flushOnError: true, // Sempre flush erros
+    maxCapacity: 1000, // Não será aplicado quando saveAllLogs = true
+    enableFileLogging: true,
+    enableHiveLogging: true,
+    saveAllLogs: true, // Nova funcionalidade: salvar todos os logs do dia
+  );
+
+  final history = await TalkerPersistentHistory.create(
+    logName: 'app_logs',
+    savePath: 'logs',
+    config: config,
+  );
+
+  final talker = Talker(history: history);
+
+  // Simula logs de uma aplicação durante o dia
+  talker.info('Aplicação iniciada');
+  talker.info('Usuário fez login: joao@email.com');
+  talker.debug('Processando requisição de pagamento');
+  talker.info('Pagamento processado com sucesso: R\$ 150,00');
+
+  // Simula alguns erros
+  talker.warning('Tentativa de conexão falhou, tentando novamente...');
+  talker.error('Erro na validação do cartão');
+  talker.info('Usuário cancelou a operação');
+
+  // Mais logs normais
+  for (int i = 1; i <= 5; i++) {
+    talker.info('Log de atividade $i');
+    await Future.delayed(Duration(milliseconds: 100));
+  }
+
+  talker.info('Aplicação finalizada');
+
+  print('✅ Logs salvos em arquivo com nome baseado na data atual');
+  print('📁 Verifique a pasta logs/ para ver o arquivo app_logs-YYYY-MM-DD.log');
+
+  await history.dispose();
+}
+
 /// Exemplo de uso em produção
 Future<void> exemploProducao() async {
   // Configuração otimizada para produção
@@ -145,7 +194,7 @@ Future<void> exemploProducao() async {
     // Simula uma operação que pode falhar
     await Future.delayed(Duration(seconds: 1));
     throw Exception('Erro de conexão com banco');
-  } catch (e, stack) {
+  } catch (e, _) {
     talker.error('Falha na conexão: $e');
   }
 

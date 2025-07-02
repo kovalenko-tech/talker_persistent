@@ -22,6 +22,8 @@ class FileOperationMessage {
   final String? filePath;
   final List<String>? logs;
   final int? maxCapacity;
+  final bool? saveAllLogs;
+  final LogRetentionPeriod? logRetentionPeriod;
   SendPort? responsePort;
 
   FileOperationMessage({
@@ -29,6 +31,8 @@ class FileOperationMessage {
     this.filePath,
     this.logs,
     this.maxCapacity,
+    this.saveAllLogs,
+    this.logRetentionPeriod,
     this.responsePort,
   });
 }
@@ -55,6 +59,9 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
 
   File? logFile;
   int currentLogCount = 0;
+  bool saveAllLogs = false;
+  String? currentDate;
+  LogRetentionPeriod? logRetentionPeriod;
 
   await for (final message in receivePort) {
     if (message is FileOperationMessage) {
@@ -62,7 +69,62 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
         switch (message.type) {
           case FileOperationType.initialize:
             if (message.filePath != null) {
-              logFile = File(message.filePath!);
+              saveAllLogs = message.saveAllLogs ?? false;
+              logRetentionPeriod = message.logRetentionPeriod;
+
+              if (saveAllLogs) {
+                // Para saveAllLogs, o arquivo será baseado na data atual
+                final now = DateTime.now();
+                currentDate = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+                final basePath = path.dirname(message.filePath!);
+                final baseName = path.basenameWithoutExtension(message.filePath!);
+                final dailyFilePath = path.join(basePath, '$baseName-$currentDate.log');
+                logFile = File(dailyFilePath);
+                // Apaga arquivos antigos conforme retenção
+                if (logRetentionPeriod != null) {
+                  final dir = Directory(basePath);
+                  if (await dir.exists()) {
+                    final files = await dir.list().toList();
+                    final now = DateTime.now();
+                    Duration retention;
+                    switch (logRetentionPeriod) {
+                      case LogRetentionPeriod.threeDays:
+                        retention = Duration(days: 3);
+                        break;
+                      case LogRetentionPeriod.week:
+                        retention = Duration(days: 7);
+                        break;
+                      case LogRetentionPeriod.fortnight:
+                        retention = Duration(days: 15);
+                        break;
+                      case LogRetentionPeriod.month:
+                        retention = Duration(days: 31);
+                        break;
+                      default:
+                        retention = Duration(days: 3650); // 10 anos, fallback
+                    }
+                    for (final f in files) {
+                      if (f is File && f.path.contains(baseName) && f.path.endsWith('.log')) {
+                        final regex = RegExp(r'(\d{4})-(\d{2})-(\d{2})');
+                        final match = regex.firstMatch(f.path);
+                        if (match != null) {
+                          final fileDate = DateTime(
+                            int.parse(match.group(1)!),
+                            int.parse(match.group(2)!),
+                            int.parse(match.group(3)!),
+                          );
+                          if (now.difference(fileDate) > retention) {
+                            await f.delete();
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } else {
+                logFile = File(message.filePath!);
+              }
+
               await logFile.parent.create(recursive: true);
               if (await logFile.exists()) {
                 final content = await logFile.readAsString();
@@ -76,10 +138,27 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
 
           case FileOperationType.write:
             if (logFile != null && message.logs != null) {
+              // Verifica se mudou o dia quando saveAllLogs está ativo
+              if (saveAllLogs) {
+                final now = DateTime.now();
+                final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+
+                if (currentDate != today) {
+                  // Mudou o dia, cria novo arquivo
+                  currentDate = today;
+                  final basePath = logFile.parent.path;
+                  final baseName = path.basenameWithoutExtension(logFile.path).split('-').first;
+                  final dailyFilePath = path.join(basePath, '$baseName-$currentDate.log');
+                  logFile = File(dailyFilePath);
+                  currentLogCount = 0;
+                }
+              }
+
               final content = '${message.logs!.join('\n')}\n';
               final newLogCount = '┌'.allMatches(content).length;
 
-              if (message.maxCapacity != null) {
+              if (message.maxCapacity != null && !saveAllLogs) {
+                // Aplica maxCapacity apenas quando não está salvando todos os logs
                 final fileContent = await logFile.readAsString();
                 final lines = fileContent.split('\n');
                 final logs = <String>[];
@@ -109,6 +188,7 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
                 await logFile.writeAsString('${keepLogs.join('\n')}\n');
                 currentLogCount = keepLogs.length;
               } else {
+                // Para saveAllLogs, sempre adiciona ao final do arquivo
                 await logFile.writeAsString(content, mode: FileMode.append);
                 currentLogCount += newLogCount;
               }
@@ -129,6 +209,7 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
           case FileOperationType.dispose:
             logFile = null;
             currentLogCount = 0;
+            currentDate = null;
             message.responsePort?.send(FileOperationResponse(success: true));
             break;
         }
@@ -140,6 +221,14 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
       }
     }
   }
+}
+
+/// Enum para definir o período de retenção dos arquivos de log
+enum LogRetentionPeriod {
+  threeDays,
+  week,
+  fortnight,
+  month,
 }
 
 /// Configuration class for TalkerPersistentHistory
@@ -160,12 +249,21 @@ class TalkerPersistentConfig {
   /// Whether to enable Hive database logging
   final bool enableHiveLogging;
 
+  /// Whether to save all logs of the day in a daily file
+  /// When true, logs will be saved in files named as 'logName-YYYY-MM-DD.log'
+  final bool saveAllLogs;
+
+  /// Período de retenção dos arquivos de log (usado com saveAllLogs)
+  final LogRetentionPeriod logRetentionPeriod;
+
   const TalkerPersistentConfig({
     this.bufferSize = 100,
     this.flushOnError = true,
     this.maxCapacity = 1000,
     this.enableFileLogging = true,
     this.enableHiveLogging = true,
+    this.saveAllLogs = false,
+    this.logRetentionPeriod = LogRetentionPeriod.threeDays,
   });
 }
 
@@ -203,6 +301,7 @@ class TalkerPersistentHistory implements TalkerHistory {
         log('📊 Buffer size: ${config.bufferSize} (${config.bufferSize == 0 ? 'real-time' : 'buffered'})');
         log('🚨 Flush on error: ${config.flushOnError}');
         log('💾 Max capacity: ${config.maxCapacity}');
+        log('📅 Save all logs: ${config.saveAllLogs}');
 
         if (!_isInitialized) {
           _receivePort = ReceivePort();
@@ -217,6 +316,8 @@ class TalkerPersistentHistory implements TalkerHistory {
           final response = await _sendMessage(FileOperationMessage(
             type: FileOperationType.initialize,
             filePath: logFilePath,
+            saveAllLogs: config.saveAllLogs,
+            logRetentionPeriod: config.logRetentionPeriod,
           ));
 
           if (!response.success) {
@@ -260,7 +361,7 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Rotates the log file by keeping only the most recent logs
   Future<void> _rotateLogFile() async {
-    if (_receivePort == null || !config.enableFileLogging) return;
+    if (_receivePort == null || !config.enableFileLogging || config.saveAllLogs) return;
 
     try {
       final response = await _sendMessage(FileOperationMessage(
@@ -319,7 +420,7 @@ class TalkerPersistentHistory implements TalkerHistory {
       final response = await _sendMessage(FileOperationMessage(
         type: FileOperationType.write,
         logs: _writeBuffer,
-        maxCapacity: config.maxCapacity,
+        maxCapacity: config.saveAllLogs ? null : config.maxCapacity,
       ));
 
       if (!response.success) {
@@ -371,7 +472,9 @@ class TalkerPersistentHistory implements TalkerHistory {
                   : 'buffer full';
           log('🔄 Flushing buffer ($reason)');
           _flushBuffer();
-          _rotateLogFile();
+          if (!config.saveAllLogs) {
+            _rotateLogFile();
+          }
         }
       } catch (e, stack) {
         log('❌ Error adding log to buffer:');

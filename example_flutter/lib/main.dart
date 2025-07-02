@@ -75,7 +75,6 @@ class _MyHomePageState extends State<MyHomePage> {
       _history = await TalkerPersistentHistory.create(
         logName: 'biel',
         savePath: logsPath,
-        maxCapacity: 3,
       );
       log('✅ TalkerPersistentHistory inicializado');
 
