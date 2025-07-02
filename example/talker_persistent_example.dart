@@ -132,6 +132,8 @@ Future<void> exemploSaveAllLogs() async {
     enableFileLogging: true,
     enableHiveLogging: true,
     saveAllLogs: true, // Nova funcionalidade: salvar todos os logs do dia
+    logRetentionPeriod: LogRetentionPeriod.week, // Mantém logs por 1 semana
+    maxFileSize: 50 * 1024 * 1024, // 50MB por arquivo
   );
 
   final history = await TalkerPersistentHistory.create(
@@ -163,6 +165,8 @@ Future<void> exemploSaveAllLogs() async {
 
   print('✅ Logs salvos em arquivo com nome baseado na data atual');
   print('📁 Verifique a pasta logs/ para ver o arquivo app_logs-YYYY-MM-DD.log');
+  print('📏 Arquivos serão rotacionados quando atingirem 50MB');
+  print('🗑️ Arquivos antigos (mais de 1 semana) serão apagados automaticamente');
 
   await history.dispose();
 }
