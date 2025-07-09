@@ -164,7 +164,7 @@ Future<void> exemploSaveAllLogs() async {
   talker.info('Aplicação finalizada');
 
   print('✅ Logs salvos em arquivo com nome baseado na data atual');
-  print('📁 Verifique a pasta logs/ para ver o arquivo app_logs-YYYY-MM-DD.log');
+  print('📁 Verifique a pasta logs/ para ver o arquivo app_logs-YYYY-MM-DD.txt');
   print('📏 Arquivos serão rotacionados quando atingirem 50MB');
   print('🗑️ Arquivos antigos (mais de 1 semana) serão apagados automaticamente');
 

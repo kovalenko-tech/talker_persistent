@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.1.0] - 2024-12-19
+
+### Added
+- **Controle de Tamanho de Arquivo**: Nova funcionalidade `maxFileSize` para limitar o tamanho dos arquivos de log
+- **Rotações Automáticas**: Quando o arquivo atinge o limite de tamanho, remove automaticamente a metade mais antiga dos logs
+- **Prevenção de Crescimento Indefinido**: Sistema inteligente que mantém apenas os logs mais recentes
+- **Configuração Padrão**: Limite padrão de 5MB para todos os arquivos de log
+- **Logs Informativos**: Feedback sobre rotações de arquivo e logs removidos
+
+### Benefits
+- ✅ Previne problemas de espaço em disco
+- ✅ Mantém logs recentes para debugging
+- ✅ Limpeza automática sem intervenção manual
+- ✅ Limite de tamanho configurável
+- ✅ Preserva integridade dos logs
+
 ## [2.0.0+1] - 2024-12-19
 
 ### Added

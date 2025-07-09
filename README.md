@@ -99,6 +99,9 @@ final history = await TalkerPersistentHistory.create(
 | `maxCapacity` | `int` | `1000` | Maximum number of logs to keep in history |
 | `enableFileLogging` | `bool` | `true` | Whether to enable file logging |
 | `enableHiveLogging` | `bool` | `true` | Whether to enable Hive database logging |
+| `saveAllLogs` | `bool` | `false` | Whether to save all logs of the day in daily files |
+| `logRetentionPeriod` | `LogRetentionPeriod` | `threeDays` | Period to retain log files when using saveAllLogs |
+| `maxFileSize` | `int` | `5MB` | Maximum file size in bytes. When reached, removes oldest half |
 
 ### Real-time Logging
 
@@ -171,6 +174,38 @@ talker.critical('Application crash detected');
 talker.info('User logged in');
 talker.debug('Processing request');
 ```
+
+### File Size Control
+
+The package now includes automatic file size management to prevent log files from growing too large:
+
+```dart
+final config = TalkerPersistentConfig(
+  bufferSize: 0, // Real-time logging
+  maxFileSize: 5 * 1024 * 1024, // 5MB limit
+  enableFileLogging: true,
+);
+
+final history = await TalkerPersistentHistory.create(
+  logName: 'controlled_logs',
+  savePath: 'logs',
+  config: config,
+);
+```
+
+**How it works:**
+- When the log file reaches the specified `maxFileSize` (default: 5MB)
+- The system automatically removes the oldest half of the logs
+- Keeps only the most recent logs
+- This prevents the file from growing indefinitely
+- Perfect for long-running applications
+
+**Benefits:**
+- ✅ Prevents disk space issues
+- ✅ Maintains recent logs for debugging
+- ✅ Automatic cleanup without manual intervention
+- ✅ Configurable size limit
+- ✅ Preserves log integrity
 
 ## Examples
 

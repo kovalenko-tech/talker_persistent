@@ -1,11 +1,12 @@
 import 'dart:developer';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:async';
 import 'dart:math' as math;
 import 'package:talker/talker.dart';
 import 'package:path/path.dart' as path;
+import 'package:talker_dio_logger/dio_logs.dart';
 import 'package:talker_persistent/src/talker_persistent_service.dart';
-import 'package:talker_persistent/src/pretty_talker.dart';
 import 'package:hive_ce/hive.dart';
 
 /// Message types for isolate communication
@@ -17,6 +18,9 @@ enum FileOperationType {
 }
 
 /// Message class for isolate communication
+///
+const String _extension = 'log';
+
 class FileOperationMessage {
   final FileOperationType type;
   final String? filePath;
@@ -25,6 +29,7 @@ class FileOperationMessage {
   final bool? saveAllLogs;
   final LogRetentionPeriod? logRetentionPeriod;
   final int? maxFileSize;
+  final String? logName; // Identificador único para cada instância
   SendPort? responsePort;
 
   FileOperationMessage({
@@ -35,6 +40,7 @@ class FileOperationMessage {
     this.saveAllLogs,
     this.logRetentionPeriod,
     this.maxFileSize,
+    this.logName,
     this.responsePort,
   });
 }
@@ -54,21 +60,262 @@ class FileOperationResponse {
   });
 }
 
-/// Isolate function to handle file operations
+/// Classe para gerenciar o isolate singleton
+class _IsolateManager {
+  static _IsolateManager? _instance;
+  static _IsolateManager get instance => _instance ??= _IsolateManager._();
+
+  Isolate? _isolate;
+  SendPort? _sendPort;
+  ReceivePort? _receivePort;
+  ReceivePort? _responsePort;
+  bool _isInitialized = false;
+  final Map<String, Completer<FileOperationResponse>> _pendingRequests = {};
+  Completer<void>? _initializationCompleter;
+
+  _IsolateManager._();
+
+  Future<void> initialize() async {
+    // Se já está inicializado, retorna imediatamente
+    if (_isInitialized) {
+      return;
+    }
+
+    // Se já está inicializando, aguarda
+    if (_initializationCompleter != null) {
+      await _initializationCompleter!.future;
+      return;
+    }
+
+    // Inicia inicialização
+    _initializationCompleter = Completer<void>();
+
+    try {
+      _receivePort = ReceivePort();
+      _isolate = await Isolate.spawn(_fileOperationsIsolate, _receivePort!.sendPort);
+
+      // Timeout para evitar travamento
+      _sendPort = await _receivePort!.first.timeout(
+        Duration(seconds: 10),
+        onTimeout: () {
+          throw Exception('Isolate initialization timeout');
+        },
+      ) as SendPort;
+
+      _responsePort = ReceivePort();
+
+      // Listener para respostas - usando ReceivePort separado
+      _responsePort!.listen((message) {
+        // Se for uma resposta de operação
+        if (message is Map<String, dynamic> && message.containsKey('requestId')) {
+          final requestId = message['requestId'] as String;
+          final response = FileOperationResponse(
+            success: message['success'] as bool,
+            error: message['error'] as String?,
+            logCount: message['logCount'] as int?,
+            content: message['content'] as String?,
+          );
+
+          final completer = _pendingRequests.remove(requestId);
+          if (completer != null) {
+            completer.complete(response);
+          }
+        }
+      });
+
+      _isInitialized = true;
+      _initializationCompleter!.complete();
+    } catch (e, stack) {
+      _initializationCompleter!.completeError(e);
+      _initializationCompleter = null;
+      throw Exception('Failed to initialize isolate: $e');
+    }
+  }
+
+  Future<FileOperationResponse> sendMessage(FileOperationMessage message) async {
+    if (!_isInitialized) {
+      await initialize();
+    }
+
+    final requestId = '${DateTime.now().millisecondsSinceEpoch}_${math.Random().nextInt(1000000)}';
+
+    final completer = Completer<FileOperationResponse>();
+    _pendingRequests[requestId] = completer;
+
+    final messageWithId = {
+      'requestId': requestId,
+      'type': message.type.index,
+      'filePath': message.filePath,
+      'logs': message.logs,
+      'maxCapacity': message.maxCapacity,
+      'saveAllLogs': message.saveAllLogs,
+      'logRetentionPeriod': message.logRetentionPeriod?.index,
+      'maxFileSize': message.maxFileSize,
+      'logName': message.logName,
+      'responsePort': _responsePort!.sendPort,
+    };
+
+    _sendPort!.send(messageWithId);
+
+    // Timeout para evitar travamento se o isolate não responder
+    return completer.future.timeout(
+      Duration(seconds: 30),
+      onTimeout: () {
+        _pendingRequests.remove(requestId);
+        return FileOperationResponse(
+          success: false,
+          error: 'Isolate response timeout',
+        );
+      },
+    );
+  }
+
+  void dispose() {
+    _isolate?.kill();
+    _receivePort?.close();
+    _responsePort?.close();
+    _isInitialized = false;
+    _pendingRequests.clear();
+    _initializationCompleter = null;
+  }
+}
+
+/// Isolate function to handle file operations (singleton)
 Future<void> _fileOperationsIsolate(SendPort sendPort) async {
   final receivePort = ReceivePort();
   sendPort.send(receivePort.sendPort);
 
+  // Map para gerenciar múltiplos arquivos de log
+  final Map<String, _LogFileManager> fileManagers = {};
+
+  await for (final message in receivePort) {
+    if (message is Map<String, dynamic>) {
+      try {
+        final requestId = message['requestId'] as String;
+        final type = FileOperationType.values[message['type'] as int];
+        final filePath = message['filePath'] as String?;
+        final logs = (message['logs'] as List<dynamic>?)?.cast<String>();
+        final maxCapacity = message['maxCapacity'] as int?;
+        final saveAllLogs = message['saveAllLogs'] as bool?;
+        final logRetentionPeriod = message['logRetentionPeriod'] != null ? LogRetentionPeriod.values[message['logRetentionPeriod'] as int] : null;
+        final maxFileSize = message['maxFileSize'] as int?;
+        final logName = message['logName'] as String?;
+        final responsePort = message['responsePort'] as SendPort?;
+
+        FileOperationResponse response;
+
+        switch (type) {
+          case FileOperationType.initialize:
+            if (logName != null && filePath != null) {
+              fileManagers[logName] = _LogFileManager(
+                filePath: filePath,
+                saveAllLogs: saveAllLogs ?? false,
+                logRetentionPeriod: logRetentionPeriod,
+                maxFileSize: maxFileSize,
+              );
+              await fileManagers[logName]!.initialize();
+              response = FileOperationResponse(success: true, logCount: 0);
+            } else {
+              response = FileOperationResponse(success: false, error: 'Invalid parameters');
+            }
+            break;
+
+          case FileOperationType.write:
+            if (logName != null && fileManagers.containsKey(logName)) {
+              await fileManagers[logName]!.write(logs ?? []);
+              response = FileOperationResponse(success: true);
+            } else {
+              response = FileOperationResponse(success: false, error: 'Log manager not found');
+            }
+            break;
+
+          case FileOperationType.read:
+            if (logName != null && fileManagers.containsKey(logName)) {
+              final content = await fileManagers[logName]!.read();
+              response = FileOperationResponse(success: true, content: content);
+            } else {
+              response = FileOperationResponse(success: false, error: 'Log manager not found');
+            }
+            break;
+
+          case FileOperationType.dispose:
+            if (logName != null && fileManagers.containsKey(logName)) {
+              await fileManagers[logName]!.dispose();
+              fileManagers.remove(logName);
+              response = FileOperationResponse(success: true);
+            } else {
+              response = FileOperationResponse(success: true);
+            }
+            break;
+        }
+
+        if (responsePort != null) {
+          responsePort.send({
+            'requestId': requestId,
+            'success': response.success,
+            'error': response.error,
+            'logCount': response.logCount,
+            'content': response.content,
+          });
+        }
+      } catch (e, stack) {
+        final responsePort = message['responsePort'] as SendPort?;
+        if (responsePort != null) {
+          responsePort.send({
+            'requestId': message['requestId'],
+            'success': false,
+            'error': 'Error: $e\nStack: $stack',
+          });
+        }
+      }
+    }
+  }
+}
+
+/// Classe para gerenciar um arquivo de log específico
+class _LogFileManager {
+  final String filePath;
+  final bool saveAllLogs;
+  final LogRetentionPeriod? logRetentionPeriod;
+  final int? maxFileSize;
+
   File? logFile;
   int currentLogCount = 0;
-  bool saveAllLogs = false;
   String? currentDate;
-  LogRetentionPeriod? logRetentionPeriod;
-  int? maxFileSize;
   int fileCounter = 1;
   String? baseName;
 
-  // Função para deletar arquivos antigos
+  _LogFileManager({
+    required this.filePath,
+    required this.saveAllLogs,
+    this.logRetentionPeriod,
+    this.maxFileSize,
+  });
+
+  Future<void> initialize() async {
+    baseName = path.basenameWithoutExtension(filePath);
+
+    if (saveAllLogs) {
+      final now = DateTime.now();
+      currentDate = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+      final basePath = path.dirname(filePath);
+      final dailyFilePath = path.join(basePath, '$baseName-$currentDate.$_extension');
+      logFile = File(dailyFilePath);
+      await deleteOldFiles();
+    } else {
+      logFile = File(filePath);
+    }
+
+    await logFile!.parent.create(recursive: true);
+    if (await logFile!.exists()) {
+      final content = await logFile!.readAsString();
+      currentLogCount = '┌'.allMatches(content).length;
+    } else {
+      await logFile!.writeAsString('');
+      currentLogCount = 0;
+    }
+  }
+
   Future<void> deleteOldFiles() async {
     if (logRetentionPeriod == null || baseName == null) return;
 
@@ -94,11 +341,13 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
           case LogRetentionPeriod.month:
             retention = Duration(days: 31);
             break;
+          case null:
+            retention = Duration(days: 3650); // 10 anos, fallback
+            break;
         }
 
         for (final f in files) {
-          if (f is File && f.path.contains(baseName) && f.path.endsWith('.log')) {
-            // Regex melhorado para capturar data em diferentes formatos
+          if (f is File && f.path.contains(baseName!) && f.path.endsWith('.$_extension')) {
             final regex = RegExp(r'(\d{4})-(\d{2})-(\d{2})');
             final match = regex.firstMatch(f.path);
             if (match != null) {
@@ -115,146 +364,99 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
         }
       }
     } catch (e) {
-      // Ignora erros na deleção para não interromper o logging
+      // Ignora erros na deleção
     }
   }
 
-  await for (final message in receivePort) {
-    if (message is FileOperationMessage) {
-      try {
-        switch (message.type) {
-          case FileOperationType.initialize:
-            if (message.filePath != null) {
-              saveAllLogs = message.saveAllLogs ?? false;
-              logRetentionPeriod = message.logRetentionPeriod;
-              maxFileSize = message.maxFileSize;
-              baseName = path.basenameWithoutExtension(message.filePath!);
+  Future<void> write(List<String> logs) async {
+    if (logFile == null || logs.isEmpty) return;
 
-              if (saveAllLogs) {
-                // Para saveAllLogs, o arquivo será baseado na data atual
-                final now = DateTime.now();
-                currentDate = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-                final basePath = path.dirname(message.filePath!);
-                final dailyFilePath = path.join(basePath, '$baseName-$currentDate.log');
-                logFile = File(dailyFilePath);
-                // Apaga arquivos antigos conforme retenção
-                await deleteOldFiles();
-              } else {
-                logFile = File(message.filePath!);
-              }
+    // Verifica se mudou o dia quando saveAllLogs está ativo
+    if (saveAllLogs) {
+      final now = DateTime.now();
+      final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
-              await logFile.parent.create(recursive: true);
-              if (await logFile.exists()) {
-                final content = await logFile.readAsString();
-                currentLogCount = '┌'.allMatches(content).length;
-              } else {
-                await logFile.writeAsString('');
-                currentLogCount = 0;
-              }
-            }
-            message.responsePort?.send(FileOperationResponse(success: true, logCount: currentLogCount));
-
-          case FileOperationType.write:
-            if (logFile != null && message.logs != null) {
-              // Verifica se mudou o dia quando saveAllLogs está ativo
-              if (saveAllLogs) {
-                final now = DateTime.now();
-                final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-
-                if (currentDate != today) {
-                  // Mudou o dia, cria novo arquivo
-                  currentDate = today;
-                  final basePath = logFile.parent.path;
-                  final dailyFilePath = path.join(basePath, '$baseName-$currentDate.log');
-                  logFile = File(dailyFilePath);
-                  currentLogCount = 0;
-                  fileCounter = 1;
-                  // Apaga arquivos antigos quando muda o dia
-                  await deleteOldFiles();
-                }
-              }
-
-              final content = '${message.logs!.join('\n')}\n';
-              final newLogCount = '┌'.allMatches(content).length;
-
-              // Verifica se precisa rotacionar por tamanho
-              if (maxFileSize != null && await logFile.exists()) {
-                final fileSize = await logFile.length();
-                if (fileSize + content.length > maxFileSize) {
-                  // Arquivo ficará muito grande, cria novo arquivo
-                  final basePath = logFile.parent.path;
-                  final timeStamp = DateTime.now().millisecondsSinceEpoch;
-                  final newFilePath = path.join(basePath, '${baseName}_part${fileCounter}_$timeStamp.log');
-                  logFile = File(newFilePath);
-                  currentLogCount = 0;
-                  fileCounter++;
-                }
-              }
-
-              if (message.maxCapacity != null && !saveAllLogs) {
-                // Aplica maxCapacity apenas quando não está salvando todos os logs
-                final fileContent = await logFile.readAsString();
-                final lines = fileContent.split('\n');
-                final logs = <String>[];
-                var currentLog = <String>[];
-                var foundLog = false;
-
-                for (var line in lines) {
-                  if (line.contains('┌')) {
-                    if (foundLog) {
-                      logs.add(currentLog.join('\n'));
-                    }
-                    currentLog = [line];
-                    foundLog = true;
-                  } else if (foundLog) {
-                    currentLog.add(line);
-                  }
-                }
-                if (foundLog) {
-                  logs.add(currentLog.join('\n'));
-                }
-
-                logs.addAll(message.logs!);
-
-                final skipCount = math.max(0, logs.length - message.maxCapacity!);
-                final keepLogs = logs.skip(skipCount).toList();
-
-                await logFile.writeAsString('${keepLogs.join('\n')}\n');
-                currentLogCount = keepLogs.length;
-              } else {
-                // Para saveAllLogs, sempre adiciona ao final do arquivo
-                await logFile.writeAsString(content, mode: FileMode.append);
-                currentLogCount += newLogCount;
-              }
-            }
-            message.responsePort?.send(FileOperationResponse(success: true, logCount: currentLogCount));
-
-          case FileOperationType.read:
-            if (logFile != null) {
-              final content = await logFile.readAsString();
-              currentLogCount = '┌'.allMatches(content).length;
-              message.responsePort?.send(FileOperationResponse(
-                success: true,
-                content: content,
-                logCount: currentLogCount,
-              ));
-            }
-
-          case FileOperationType.dispose:
-            logFile = null;
-            currentLogCount = 0;
-            currentDate = null;
-            baseName = null;
-            message.responsePort?.send(FileOperationResponse(success: true));
-            break;
-        }
-      } catch (e, stack) {
-        message.responsePort?.send(FileOperationResponse(
-          success: false,
-          error: 'Error: $e\nStack: $stack',
-        ));
+      if (currentDate != today) {
+        currentDate = today;
+        final basePath = logFile!.parent.path;
+        final dailyFilePath = path.join(basePath, ' $baseName-$currentDate.$_extension');
+        logFile = File(dailyFilePath);
+        currentLogCount = 0;
+        fileCounter = 1;
+        await deleteOldFiles();
       }
     }
+
+    final content = '${logs.join('\n')}\n';
+    final newLogCount = '┌'.allMatches(content).length;
+
+    // Verifica se precisa rotacionar por tamanho
+    if (maxFileSize != null && await logFile!.exists()) {
+      final fileSize = await logFile!.length();
+      if (fileSize + content.length > maxFileSize!) {
+        await _rotateFileBySize();
+      }
+    }
+
+    // Para saveAllLogs, sempre adiciona ao final do arquivo
+    await logFile!.writeAsString(content, mode: FileMode.append);
+    currentLogCount += newLogCount;
+  }
+
+  /// Rotaciona o arquivo removendo a metade mais antiga quando atinge o tamanho máximo
+  Future<void> _rotateFileBySize() async {
+    if (maxFileSize == null || !await logFile!.exists()) return;
+
+    try {
+      final content = await logFile!.readAsString();
+      final lines = content.split('\n');
+      final logs = <String>[];
+      var currentLog = <String>[];
+      var foundLog = false;
+
+      // Separa os logs individuais
+      for (var line in lines) {
+        if (line.contains('┌')) {
+          if (foundLog) {
+            logs.add(currentLog.join('\n'));
+          }
+          currentLog = [line];
+          foundLog = true;
+        } else if (foundLog) {
+          currentLog.add(line);
+        }
+      }
+      if (foundLog) {
+        logs.add(currentLog.join('\n'));
+      }
+
+      // Remove a metade mais antiga
+      final keepCount = (logs.length / 2).ceil();
+      final keepLogs = logs.skip(logs.length - keepCount).toList();
+
+      // Cria novo arquivo com apenas os logs mais recentes
+      final newContent = keepLogs.join('\n');
+      await logFile!.writeAsString(newContent);
+
+      // Atualiza o contador de logs
+      currentLogCount = '┌'.allMatches(newContent).length;
+
+      print('📊 Arquivo rotacionado - removidos ${logs.length - keepCount} logs antigos, mantidos $keepCount logs recentes');
+    } catch (e) {
+      print('❌ Erro ao rotacionar arquivo por tamanho: $e');
+    }
+  }
+
+  Future<String> read() async {
+    if (logFile == null) return '';
+    return await logFile!.readAsString();
+  }
+
+  Future<void> dispose() async {
+    logFile = null;
+    currentLogCount = 0;
+    currentDate = null;
+    baseName = null;
   }
 }
 
@@ -285,7 +487,7 @@ class TalkerPersistentConfig {
   final bool enableHiveLogging;
 
   /// Whether to save all logs of the day in a daily file
-  /// When true, logs will be saved in files named as 'logName-YYYY-MM-DD.log'
+  /// When true, logs will be saved in files named as 'logName-YYYY-MM-DD.$_extension'
   final bool saveAllLogs;
 
   /// Período de retenção dos arquivos de log (usado com saveAllLogs)
@@ -315,9 +517,6 @@ class TalkerPersistentHistory implements TalkerHistory {
   final TalkerPersistentConfig config;
 
   final List<String> _writeBuffer = [];
-  Isolate? _isolate;
-  SendPort? _sendPort;
-  ReceivePort? _receivePort;
   bool _isInitialized = false;
 
   /// Creates a new instance of [TalkerPersistentHistory].
@@ -336,7 +535,7 @@ class TalkerPersistentHistory implements TalkerHistory {
   Future<void> _initialize() async {
     try {
       if (savePath != null && config.enableFileLogging) {
-        final logFilePath = path.join(savePath!, '$logName.log');
+        final logFilePath = path.join(savePath!, '$logName.$_extension');
         log('📝 Initializing log file at: $logFilePath');
         log('📊 Buffer size: ${config.bufferSize} (${config.bufferSize == 0 ? 'real-time' : 'buffered'})');
         log('🚨 Flush on error: ${config.flushOnError}');
@@ -345,21 +544,13 @@ class TalkerPersistentHistory implements TalkerHistory {
         log('📏 Max file size: ${(config.maxFileSize / (1024 * 1024)).toStringAsFixed(1)}MB');
 
         if (!_isInitialized) {
-          _receivePort = ReceivePort();
-          _isolate = await Isolate.spawn(
-            _fileOperationsIsolate,
-            _receivePort!.sendPort,
-          );
-
-          final sendPort = await _receivePort!.first as SendPort;
-          _sendPort = sendPort;
-
-          final response = await _sendMessage(FileOperationMessage(
+          final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
             type: FileOperationType.initialize,
             filePath: logFilePath,
             saveAllLogs: config.saveAllLogs,
             logRetentionPeriod: config.logRetentionPeriod,
             maxFileSize: config.maxFileSize,
+            logName: logName,
           ));
 
           if (!response.success) {
@@ -403,11 +594,12 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Rotates the log file by keeping only the most recent logs
   Future<void> _rotateLogFile() async {
-    if (_receivePort == null || !config.enableFileLogging || config.saveAllLogs) return;
+    if (!config.enableFileLogging || config.saveAllLogs) return;
 
     try {
-      final response = await _sendMessage(FileOperationMessage(
+      final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
         type: FileOperationType.read,
+        logName: logName,
       ));
 
       if (response.success && response.content != null) {
@@ -438,10 +630,11 @@ class TalkerPersistentHistory implements TalkerHistory {
           final skipCount = math.max(0, logs.length - config.maxCapacity);
           final keepLogs = logs.skip(skipCount).toList();
 
-          await _sendMessage(FileOperationMessage(
+          await _IsolateManager.instance.sendMessage(FileOperationMessage(
             type: FileOperationType.write,
             logs: keepLogs,
             maxCapacity: config.maxCapacity,
+            logName: logName,
           ));
 
           log('📊 Log file rotated - new log count: $logCount');
@@ -459,10 +652,11 @@ class TalkerPersistentHistory implements TalkerHistory {
     if (_writeBuffer.isEmpty || !_isInitialized || !config.enableFileLogging) return;
 
     try {
-      final response = await _sendMessage(FileOperationMessage(
+      final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
         type: FileOperationType.write,
         logs: _writeBuffer,
         maxCapacity: config.saveAllLogs ? null : config.maxCapacity,
+        logName: logName,
       ));
 
       if (!response.success) {
@@ -487,15 +681,108 @@ class TalkerPersistentHistory implements TalkerHistory {
     final timestamp = data.time.toIso8601String();
     final level = data.logLevel?.name.toUpperCase() ?? 'UNKNOWN';
     String msg = (data.message ?? '').replaceAll(RegExp(r'[\r\n]+'), ' ');
-    // Trunca mensagens muito longas
-    if (msg.length > 500) {
-      msg = '${msg.substring(0, 500)}...';
+
+    // Para logs HTTP, criar logs separados para requisição e body
+    if (_isHttpLog(data)) {
+      final body = _extractHttpBody(data);
+
+      // Se tem body, retorna apenas o body (a requisição será logada separadamente)
+      if (body.isNotEmpty && body != msg) {
+        return '$timestamp [$level] [BODY]: $body';
+      }
+
+      // Se não tem body ou é igual à mensagem, retorna como requisição
+      return '$timestamp [$level] [REQUEST] $msg';
     }
+
+    // Trunca mensagens muito longas
+    if (msg.length > 800) {
+      msg = '${msg.substring(0, 800)}...';
+    }
+
     if (data.logLevel == LogLevel.error || data.logLevel == LogLevel.critical) {
       final stack = data.stackTrace?.toString().replaceAll(RegExp(r'[\r\n]+'), ' ') ?? '';
       return '$timestamp [$level] $msg${stack.isNotEmpty ? ' [STACK] $stack' : ''}';
     }
     return '$timestamp [$level] $msg';
+  }
+
+  bool _isHttpLog(TalkerData data) {
+    // Verificar se é um DioResponseLog
+    if (data is DioResponseLog) {
+      return true;
+    }
+
+    // Verificar por título
+    final title = data.title?.toLowerCase() ?? '';
+    return [
+      'httperror',
+      'httprequest',
+      'httpresponse',
+      'http-request',
+      'http-response',
+      'http-error',
+    ].contains(title);
+  }
+
+  String _extractHttpBody(TalkerData data) {
+    try {
+      final message = data.message ?? '';
+
+      // Tentar extrair diretamente do DioResponseLog se disponível
+      if (data is DioResponseLog) {
+        final response = data.response;
+        if (response.data != null) {
+          final responseData = response.data;
+
+          // Verificar se não é bytes e não é muito grande
+          if (responseData is! List<int> && responseData.toString().length < 1000) {
+            return responseData.toString();
+          }
+        }
+      }
+
+      // Extrair body da requisição (formato do TalkerDioLogger)
+      final requestBodyMatch = RegExp(r'Data:\s*(\{.*?\}|\[.*?\]|"[^"]*"|\S+)', dotAll: true).firstMatch(message);
+      if (requestBodyMatch != null) {
+        return requestBodyMatch.group(1) ?? '';
+      }
+
+      // Extrair body da resposta (formato do TalkerDioLogger)
+      final responseBodyMatch = RegExp(r'Data:\s*(\{.*?\}|\[.*?\]|"[^"]*"|\S+)', dotAll: true).firstMatch(message);
+      if (responseBodyMatch != null) {
+        return responseBodyMatch.group(1) ?? '';
+      }
+
+      // Extrair body da requisição (outros formatos)
+      final requestBodyMatch2 = RegExp(r'Body:\s*(\{.*?\}|\[.*?\]|"[^"]*"|\S+)', dotAll: true).firstMatch(message);
+      if (requestBodyMatch2 != null) {
+        return requestBodyMatch2.group(1) ?? '';
+      }
+
+      // Extrair body da resposta (outros formatos)
+      final responseBodyMatch2 = RegExp(r'Response:\s*(\{.*?\}|\[.*?\]|"[^"]*"|\S+)', dotAll: true).firstMatch(message);
+      if (responseBodyMatch2 != null) {
+        return responseBodyMatch2.group(1) ?? '';
+      }
+
+      // Tentar capturar JSON/objetos diretamente
+      final jsonMatch = RegExp(r'(\{[^{}]*\}|\[[\[\]]*\])', dotAll: true).firstMatch(message);
+      if (jsonMatch != null) {
+        return jsonMatch.group(1) ?? '';
+      }
+
+      // Tentar capturar strings entre aspas
+      final stringMatch = RegExp(r'"([^"]*)"').firstMatch(message);
+      if (stringMatch != null) {
+        return stringMatch.group(1) ?? '';
+      }
+
+      // Se não encontrou nada, retorna a mensagem inteira (URL ou o que vier)
+      return message;
+    } catch (e) {
+      return data.message ?? '';
+    }
   }
 
   @override
@@ -511,10 +798,41 @@ class TalkerPersistentHistory implements TalkerHistory {
 
     // Write to file if enabled
     if (_isInitialized && config.enableFileLogging) {
-      final formattedLog = formatLogSimple(data);
       try {
-        log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
-        _writeBuffer.add(formattedLog);
+        // Para logs HTTP, criar logs separados para requisição e resposta
+        if (_isHttpLog(data)) {
+          final body = _extractHttpBody(data);
+          final timestamp = data.time.toIso8601String();
+          final level = data.logLevel?.name.toUpperCase() ?? 'UNKNOWN';
+          final msg = (data.message ?? '').replaceAll(RegExp(r'[\r\n]+'), ' ');
+
+          // Determinar se é REQUEST ou RESPONSE baseado no título ou presença de body
+          final isResponse = data.title?.toLowerCase().contains('response') == true || (data is DioResponseLog && data.response.data != null);
+
+          if (isResponse) {
+            // Para respostas, mostrar apenas [RESPONSE]: com os dados
+            if (body.isNotEmpty && body != msg) {
+              final responseLog = '$timestamp [$level] [RESPONSE]: $body';
+              log('📝 Adding response log to buffer: ${responseLog.substring(0, math.min(50, responseLog.length))}...');
+              _writeBuffer.add(responseLog);
+            } else {
+              // Se não tem body, mostrar como resposta normal
+              final responseLog = '$timestamp [$level] [RESPONSE] $msg';
+              log('📝 Adding response log to buffer: ${responseLog.substring(0, math.min(50, responseLog.length))}...');
+              _writeBuffer.add(responseLog);
+            }
+          } else {
+            // Para requisições, mostrar [REQUEST] com a URL
+            final requestLog = '$timestamp [$level] [REQUEST] $msg';
+            log('📝 Adding request log to buffer: ${requestLog.substring(0, math.min(50, requestLog.length))}...');
+            _writeBuffer.add(requestLog);
+          }
+        } else {
+          // Log normal (não HTTP)
+          final formattedLog = formatLogSimple(data);
+          log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
+          _writeBuffer.add(formattedLog);
+        }
 
         // Check if we should flush immediately
         final shouldFlush = config.bufferSize == 0 || // Real-time mode
@@ -564,12 +882,11 @@ class TalkerPersistentHistory implements TalkerHistory {
         await _flushBuffer();
       }
 
-      await _sendMessage(FileOperationMessage(
+      await _IsolateManager.instance.sendMessage(FileOperationMessage(
         type: FileOperationType.dispose,
+        logName: logName,
       ));
 
-      _isolate?.kill();
-      _receivePort?.close();
       _isInitialized = false;
     }
 
@@ -586,22 +903,5 @@ class TalkerPersistentHistory implements TalkerHistory {
     }
 
     log('✅ TalkerPersistentHistory finalized');
-  }
-
-  Future<FileOperationResponse> _sendMessage(FileOperationMessage message) async {
-    if (_sendPort == null) {
-      throw Exception('Isolate not initialized');
-    }
-
-    final responsePort = ReceivePort();
-    message.responsePort = responsePort.sendPort;
-    _sendPort!.send(message);
-
-    try {
-      final response = await responsePort.first as FileOperationResponse;
-      return response;
-    } finally {
-      responsePort.close();
-    }
   }
 }

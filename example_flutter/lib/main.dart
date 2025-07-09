@@ -98,7 +98,7 @@ class _MyHomePageState extends State<MyHomePage> {
         log('- ${logr.displayMessage}');
       }
 
-      final logFile = File(path.join(logsPath, 'biel.log'));
+      final logFile = File(path.join(logsPath, 'biel.txt'));
       log('\n📄 Arquivo de log:');
       log(logFile.path);
 
