@@ -13,6 +13,7 @@ Future<void> testeRotacao() async {
     bufferSize: 0, // Tempo real
     flushOnError: true,
     maxCapacity: 1000,
+    useIsolate: false,
     enableFileLogging: true,
     enableHiveLogging: false, // Apenas arquivo
     saveAllLogs: false,

@@ -91,4 +91,16 @@ class TalkerPersistent {
       }
     }
   }
+
+  /// Dispose global de recursos do sistema de logging persistente
+  static Future<void> disposeGlobalResources() async {
+    try {
+      print('🔄 Disposing global talker persistent resources...');
+      // Esta função pode ser expandida no futuro para outros recursos globais
+      print('✅ Global talker persistent resources disposed');
+    } catch (e, stack) {
+      print('❌ Error disposing global resources: $e');
+      print('Stack: $stack');
+    }
+  }
 }

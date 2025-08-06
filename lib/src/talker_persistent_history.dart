@@ -106,68 +106,171 @@ class _IsolateManager {
 
       // Listener para respostas - usando ReceivePort separado
       _responsePort!.listen((message) {
-        // Se for uma resposta de operação
-        if (message is Map<String, dynamic> && message.containsKey('requestId')) {
-          final requestId = message['requestId'] as String;
-          final response = FileOperationResponse(
-            success: message['success'] as bool,
-            error: message['error'] as String?,
-            logCount: message['logCount'] as int?,
-            content: message['content'] as String?,
-          );
+        try {
+          // Se for uma resposta de operação
+          if (message is Map<String, dynamic> && message.containsKey('requestId')) {
+            final requestId = message['requestId'] as String;
+            final response = FileOperationResponse(
+              success: message['success'] as bool,
+              error: message['error'] as String?,
+              logCount: message['logCount'] as int?,
+              content: message['content'] as String?,
+            );
 
-          final completer = _pendingRequests.remove(requestId);
-          if (completer != null) {
-            completer.complete(response);
+            final completer = _pendingRequests.remove(requestId);
+            if (completer != null && !completer.isCompleted) {
+              completer.complete(response);
+            }
           }
+        } catch (e, stack) {
+          log('❌ Error in isolate response listener: $e');
+          log('Stack: $stack');
+          // Se houver erro no parsing da mensagem, tentar limpar requisições órfãs
+          _cleanupOrphanedRequests();
         }
+      }, onError: (error, stack) {
+        log('❌ Error in isolate response stream: $error');
+        log('Stack: $stack');
+        _cleanupOrphanedRequests();
       });
 
       _isInitialized = true;
       _initializationCompleter!.complete();
     } catch (e, stack) {
+      // Reset state em caso de falha
+      _isInitialized = false;
+      _isolate?.kill();
+      _receivePort?.close();
+      _responsePort?.close();
+      _isolate = null;
+      _sendPort = null;
+      _receivePort = null;
+      _responsePort = null;
+
       _initializationCompleter!.completeError(e);
       _initializationCompleter = null;
+
+      log('❌ Failed to initialize isolate: $e');
+      log('Stack: $stack');
       throw Exception('Failed to initialize isolate: $e');
     }
   }
 
   Future<FileOperationResponse> sendMessage(FileOperationMessage message) async {
-    if (!_isInitialized) {
-      await initialize();
+    try {
+      if (!_isInitialized) {
+        await initialize();
+      }
+
+      // Verifica se o isolate ainda está ativo
+      if (_sendPort == null || _responsePort == null) {
+        throw Exception('Isolate not properly initialized');
+      }
+
+      final requestId = '${DateTime.now().millisecondsSinceEpoch}_${math.Random().nextInt(1000000)}';
+
+      final completer = Completer<FileOperationResponse>();
+      _pendingRequests[requestId] = completer;
+
+      final messageWithId = {
+        'requestId': requestId,
+        'type': message.type.index,
+        'filePath': message.filePath,
+        'logs': message.logs,
+        'maxCapacity': message.maxCapacity,
+        'saveAllLogs': message.saveAllLogs,
+        'logRetentionPeriod': message.logRetentionPeriod?.index,
+        'maxFileSize': message.maxFileSize,
+        'logName': message.logName,
+        'responsePort': _responsePort!.sendPort,
+      };
+
+      _sendPort!.send(messageWithId);
+
+      // Timeout para evitar travamento se o isolate não responder
+      return completer.future.timeout(
+        Duration(seconds: 30),
+        onTimeout: () {
+          _pendingRequests.remove(requestId);
+          log('⚠️ Isolate response timeout for request: $requestId');
+          return FileOperationResponse(
+            success: false,
+            error: 'Isolate response timeout',
+          );
+        },
+      );
+    } catch (e, stack) {
+      log('❌ Error sending message to isolate: $e');
+      log('Stack: $stack');
+      return FileOperationResponse(
+        success: false,
+        error: 'Failed to send message to isolate: $e',
+      );
+    }
+  }
+
+  /// Limpa requisições órfãs que podem ter ficado pendentes
+  void _cleanupOrphanedRequests() {
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final orphanedKeys = <String>[];
+
+    for (final entry in _pendingRequests.entries) {
+      final requestTime = int.tryParse(entry.key.split('_').first) ?? 0;
+      // Remove requisições com mais de 60 segundos
+      if (now - requestTime > 60000) {
+        orphanedKeys.add(entry.key);
+        if (!entry.value.isCompleted) {
+          entry.value.completeError('Request timed out and was cleaned up');
+        }
+      }
     }
 
-    final requestId = '${DateTime.now().millisecondsSinceEpoch}_${math.Random().nextInt(1000000)}';
+    for (final key in orphanedKeys) {
+      _pendingRequests.remove(key);
+    }
 
-    final completer = Completer<FileOperationResponse>();
-    _pendingRequests[requestId] = completer;
+    if (orphanedKeys.isNotEmpty) {
+      log('🧹 Cleaned up ${orphanedKeys.length} orphaned requests');
+    }
 
-    final messageWithId = {
-      'requestId': requestId,
-      'type': message.type.index,
-      'filePath': message.filePath,
-      'logs': message.logs,
-      'maxCapacity': message.maxCapacity,
-      'saveAllLogs': message.saveAllLogs,
-      'logRetentionPeriod': message.logRetentionPeriod?.index,
-      'maxFileSize': message.maxFileSize,
-      'logName': message.logName,
-      'responsePort': _responsePort!.sendPort,
-    };
+    // Se há muitas requisições pendentes, pode indicar problemas no isolate
+    if (_pendingRequests.length > 50) {
+      log('🚨 WARNING: Too many pending requests (${_pendingRequests.length}), isolate may be stuck');
+      _forceResetIsolate();
+    }
+  }
 
-    _sendPort!.send(messageWithId);
+  /// Reset forçado do isolate em caso de problemas críticos
+  void _forceResetIsolate() {
+    try {
+      log('🔄 Force resetting isolate due to critical issues...');
 
-    // Timeout para evitar travamento se o isolate não responder
-    return completer.future.timeout(
-      Duration(seconds: 30),
-      onTimeout: () {
-        _pendingRequests.remove(requestId);
-        return FileOperationResponse(
-          success: false,
-          error: 'Isolate response timeout',
-        );
-      },
-    );
+      // Completar todas as requisições pendentes com erro
+      for (final completer in _pendingRequests.values) {
+        if (!completer.isCompleted) {
+          completer.completeError('Isolate force reset');
+        }
+      }
+      _pendingRequests.clear();
+
+      // Matar o isolate atual
+      _isolate?.kill();
+      _receivePort?.close();
+      _responsePort?.close();
+
+      // Reset state
+      _isolate = null;
+      _sendPort = null;
+      _receivePort = null;
+      _responsePort = null;
+      _isInitialized = false;
+      _initializationCompleter = null;
+
+      log('✅ Isolate force reset completed');
+    } catch (e, stack) {
+      log('❌ Error during force reset: $e');
+      log('Stack: $stack');
+    }
   }
 
   void dispose() {
@@ -175,6 +278,12 @@ class _IsolateManager {
     _receivePort?.close();
     _responsePort?.close();
     _isInitialized = false;
+    // Completa todas as requisições pendentes com erro antes de limpar
+    for (final completer in _pendingRequests.values) {
+      if (!completer.isCompleted) {
+        completer.completeError('Isolate disposed');
+      }
+    }
     _pendingRequests.clear();
     _initializationCompleter = null;
   }
@@ -182,25 +291,62 @@ class _IsolateManager {
 
 /// Isolate function to handle file operations (singleton)
 Future<void> _fileOperationsIsolate(SendPort sendPort) async {
-  final receivePort = ReceivePort();
-  sendPort.send(receivePort.sendPort);
+  try {
+    final receivePort = ReceivePort();
+    sendPort.send(receivePort.sendPort);
 
-  // Map para gerenciar múltiplos arquivos de log
-  final Map<String, _LogFileManager> fileManagers = {};
+    // Map para gerenciar múltiplos arquivos de log
+    final Map<String, _LogFileManager> fileManagers = {};
 
-  await for (final message in receivePort) {
-    if (message is Map<String, dynamic>) {
+    await for (final message in receivePort) {
+      // PROTEÇÃO TOTAL: Envolver tudo em try-catch para evitar crashes
+      String? requestId;
+      SendPort? responsePort;
+
       try {
-        final requestId = message['requestId'] as String;
-        final type = FileOperationType.values[message['type'] as int];
+        if (message is! Map<String, dynamic>) {
+          print('❌ Invalid message type received in isolate: ${message.runtimeType}');
+          continue;
+        }
+
+        // SAFE CASTING: Verificar cada campo antes de fazer cast
+        requestId = message['requestId']?.toString();
+        if (requestId == null || requestId.isEmpty) {
+          print('❌ Missing or invalid requestId in isolate message');
+          continue;
+        }
+
+        final typeIndex = message['type'];
+        if (typeIndex is! int || typeIndex < 0 || typeIndex >= FileOperationType.values.length) {
+          throw Exception('Invalid operation type index: $typeIndex');
+        }
+        final type = FileOperationType.values[typeIndex];
+
         final filePath = message['filePath'] as String?;
-        final logs = (message['logs'] as List<dynamic>?)?.cast<String>();
+
+        // Safe casting para logs
+        List<String>? logs;
+        if (message['logs'] is List) {
+          try {
+            logs = (message['logs'] as List<dynamic>).map((e) => e.toString()).toList();
+          } catch (e) {
+            logs = null;
+          }
+        }
+
         final maxCapacity = message['maxCapacity'] as int?;
         final saveAllLogs = message['saveAllLogs'] as bool?;
-        final logRetentionPeriod = message['logRetentionPeriod'] != null ? LogRetentionPeriod.values[message['logRetentionPeriod'] as int] : null;
+
+        // Safe casting para logRetentionPeriod
+        LogRetentionPeriod? logRetentionPeriod;
+        final retentionIndex = message['logRetentionPeriod'];
+        if (retentionIndex is int && retentionIndex >= 0 && retentionIndex < LogRetentionPeriod.values.length) {
+          logRetentionPeriod = LogRetentionPeriod.values[retentionIndex];
+        }
+
         final maxFileSize = message['maxFileSize'] as int?;
         final logName = message['logName'] as String?;
-        final responsePort = message['responsePort'] as SendPort?;
+        responsePort = message['responsePort'] as SendPort?;
 
         FileOperationResponse response;
 
@@ -259,15 +405,36 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
           });
         }
       } catch (e, stack) {
-        final responsePort = message['responsePort'] as SendPort?;
-        if (responsePort != null) {
-          responsePort.send({
-            'requestId': message['requestId'],
-            'success': false,
-            'error': 'Error: $e\nStack: $stack',
-          });
+        print('❌ ISOLATE ERROR: $e');
+        print('Stack: $stack');
+
+        // Tentar responder com o erro, mas de forma segura
+        try {
+          if (responsePort != null && requestId != null) {
+            responsePort.send({
+              'requestId': requestId,
+              'success': false,
+              'error': 'Isolate operation error: $e',
+            });
+          }
+        } catch (sendError) {
+          print('❌ Failed to send error response: $sendError');
         }
       }
+    }
+  } catch (globalError, globalStack) {
+    // PROTEÇÃO GLOBAL: Se qualquer coisa falhar no isolate, capturar aqui
+    print('❌ CRITICAL ISOLATE ERROR: $globalError');
+    print('Global Stack: $globalStack');
+
+    // Tentar notificar o erro de volta, mas não crashar se falhar
+    try {
+      sendPort.send({
+        'isolateError': true,
+        'error': 'Critical isolate failure: $globalError',
+      });
+    } catch (criticalError) {
+      print('❌ CRITICAL: Cannot send isolate error notification: $criticalError');
     }
   }
 }
@@ -293,26 +460,61 @@ class _LogFileManager {
   });
 
   Future<void> initialize() async {
-    baseName = path.basenameWithoutExtension(filePath);
+    try {
+      if (filePath.isEmpty) {
+        throw Exception('File path cannot be empty');
+      }
 
-    if (saveAllLogs) {
-      final now = DateTime.now();
-      currentDate = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-      final basePath = path.dirname(filePath);
-      final dailyFilePath = path.join(basePath, '$baseName-$currentDate.$_extension');
-      logFile = File(dailyFilePath);
-      await deleteOldFiles();
-    } else {
-      logFile = File(filePath);
-    }
+      baseName = path.basenameWithoutExtension(filePath);
+      if (baseName == null || baseName!.isEmpty) {
+        baseName = 'log';
+      }
 
-    await logFile!.parent.create(recursive: true);
-    if (await logFile!.exists()) {
-      final content = await logFile!.readAsString();
-      currentLogCount = '┌'.allMatches(content).length;
-    } else {
-      await logFile!.writeAsString('');
-      currentLogCount = 0;
+      if (saveAllLogs) {
+        final now = DateTime.now();
+        currentDate = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
+        final basePath = path.dirname(filePath);
+        final dailyFilePath = path.join(basePath, '$baseName-$currentDate.$_extension');
+        logFile = File(dailyFilePath);
+        await deleteOldFiles();
+      } else {
+        logFile = File(filePath);
+      }
+
+      if (logFile == null) {
+        throw Exception('Failed to create log file instance');
+      }
+
+      // Criar diretório pai de forma segura
+      try {
+        await logFile!.parent.create(recursive: true);
+      } catch (e) {
+        print('⚠️ Warning: Could not create parent directory: $e');
+        // Continuar mesmo se falhar, pode ser que já exista
+      }
+
+      // Verificar e criar arquivo de forma segura
+      if (await logFile!.exists()) {
+        try {
+          final content = await logFile!.readAsString();
+          currentLogCount = '┌'.allMatches(content).length;
+        } catch (e) {
+          print('⚠️ Warning: Could not read existing log file, starting fresh: $e');
+          currentLogCount = 0;
+        }
+      } else {
+        try {
+          await logFile!.writeAsString('');
+          currentLogCount = 0;
+        } catch (e) {
+          print('⚠️ Warning: Could not create initial log file: $e');
+          currentLogCount = 0;
+        }
+      }
+    } catch (e, stack) {
+      print('❌ CRITICAL: LogFileManager initialization failed: $e');
+      print('Stack: $stack');
+      rethrow;
     }
   }
 
@@ -369,38 +571,75 @@ class _LogFileManager {
   }
 
   Future<void> write(List<String> logs) async {
-    if (logFile == null || logs.isEmpty) return;
-
-    // Verifica se mudou o dia quando saveAllLogs está ativo
-    if (saveAllLogs) {
-      final now = DateTime.now();
-      final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
-
-      if (currentDate != today) {
-        currentDate = today;
-        final basePath = logFile!.parent.path;
-        final dailyFilePath = path.join(basePath, ' $baseName-$currentDate.$_extension');
-        logFile = File(dailyFilePath);
-        currentLogCount = 0;
-        fileCounter = 1;
-        await deleteOldFiles();
+    try {
+      if (logFile == null || logs.isEmpty) {
+        print('⚠️ Warning: Cannot write - logFile is null or logs are empty');
+        return;
       }
-    }
 
-    final content = '${logs.join('\n')}\n';
-    final newLogCount = '┌'.allMatches(content).length;
+      // Verifica se mudou o dia quando saveAllLogs está ativo
+      if (saveAllLogs) {
+        try {
+          final now = DateTime.now();
+          final today = '${now.year}-${now.month.toString().padLeft(2, '0')}-${now.day.toString().padLeft(2, '0')}';
 
-    // Verifica se precisa rotacionar por tamanho
-    if (maxFileSize != null && await logFile!.exists()) {
-      final fileSize = await logFile!.length();
-      if (fileSize + content.length > maxFileSize!) {
-        await _rotateFileBySize();
+          if (currentDate != today) {
+            currentDate = today;
+            final basePath = logFile!.parent.path;
+            final dailyFilePath = path.join(basePath, '$baseName-$currentDate.$_extension');
+            logFile = File(dailyFilePath);
+            currentLogCount = 0;
+            fileCounter = 1;
+            await deleteOldFiles();
+          }
+        } catch (e) {
+          print('⚠️ Warning: Error in date rotation: $e');
+          // Continuar com o arquivo atual
+        }
       }
-    }
 
-    // Para saveAllLogs, sempre adiciona ao final do arquivo
-    await logFile!.writeAsString(content, mode: FileMode.append);
-    currentLogCount += newLogCount;
+      final content = '${logs.join('\n')}\n';
+      final newLogCount = '┌'.allMatches(content).length;
+
+      // Verifica se precisa rotacionar por tamanho - com proteção
+      if (maxFileSize != null) {
+        try {
+          if (await logFile!.exists()) {
+            final fileSize = await logFile!.length();
+            if (fileSize + content.length > maxFileSize!) {
+              await _rotateFileBySize();
+            }
+          }
+        } catch (e) {
+          print('⚠️ Warning: Error checking file size for rotation: $e');
+          // Continuar sem rotação
+        }
+      }
+
+      // Para saveAllLogs, sempre adiciona ao final do arquivo - com proteção
+      try {
+        await logFile!.writeAsString(content, mode: FileMode.append);
+        currentLogCount += newLogCount;
+      } catch (e) {
+        print('❌ CRITICAL: Failed to write to log file: $e');
+
+        // Tentar recovery - criar novo arquivo se necessário
+        try {
+          await logFile!.parent.create(recursive: true);
+          await logFile!.writeAsString(content, mode: FileMode.write);
+          currentLogCount = newLogCount;
+          print('✅ Recovery successful - created new log file');
+        } catch (recoveryError) {
+          print('❌ CRITICAL: Recovery also failed: $recoveryError');
+          throw Exception('Failed to write log and recovery failed: $e -> $recoveryError');
+        }
+      }
+    } catch (e, stack) {
+      print('❌ CRITICAL: LogFileManager.write() failed completely: $e');
+      print('Stack: $stack');
+      // NÃO fazer rethrow aqui para evitar crash do isolate
+      // O erro já foi logado, melhor continuar funcionando
+    }
   }
 
   /// Rotaciona o arquivo removendo a metade mais antiga quando atinge o tamanho máximo
@@ -497,6 +736,10 @@ class TalkerPersistentConfig {
   /// Quando o arquivo atinge este tamanho, um novo arquivo é criado
   final int maxFileSize;
 
+  /// Se deve usar isolate para operações de arquivo (padrão: true)
+  /// Quando false, as operações de arquivo são feitas na thread principal
+  final bool useIsolate;
+
   const TalkerPersistentConfig({
     this.bufferSize = 100,
     this.flushOnError = true,
@@ -506,6 +749,7 @@ class TalkerPersistentConfig {
     this.saveAllLogs = false,
     this.logRetentionPeriod = LogRetentionPeriod.threeDays,
     this.maxFileSize = 5 * 1024 * 1024, // 5MB
+    this.useIsolate = true,
   });
 }
 
@@ -518,6 +762,9 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   final List<String> _writeBuffer = [];
   bool _isInitialized = false;
+
+  // Manager de arquivo direto (sem isolate)
+  _LogFileManager? _directFileManager;
 
   /// Creates a new instance of [TalkerPersistentHistory].
   ///
@@ -542,22 +789,49 @@ class TalkerPersistentHistory implements TalkerHistory {
         log('💾 Max capacity: ${config.maxCapacity}');
         log('📅 Save all logs: ${config.saveAllLogs}');
         log('📏 Max file size: ${(config.maxFileSize / (1024 * 1024)).toStringAsFixed(1)}MB');
+        log('🔧 Use isolate: ${config.useIsolate}');
 
         if (!_isInitialized) {
-          final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
-            type: FileOperationType.initialize,
-            filePath: logFilePath,
-            saveAllLogs: config.saveAllLogs,
-            logRetentionPeriod: config.logRetentionPeriod,
-            maxFileSize: config.maxFileSize,
-            logName: logName,
-          ));
+          try {
+            if (config.useIsolate) {
+              // Usar isolate para operações de arquivo
+              final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
+                type: FileOperationType.initialize,
+                filePath: logFilePath,
+                saveAllLogs: config.saveAllLogs,
+                logRetentionPeriod: config.logRetentionPeriod,
+                maxFileSize: config.maxFileSize,
+                logName: logName,
+              ));
 
-          if (!response.success) {
-            throw Exception(response.error);
+              if (!response.success) {
+                log('❌ Isolate initialization failed: ${response.error}');
+                // NÃO fazer throw aqui, apenas desabilitar file logging
+                _isInitialized = false;
+                log('⚠️ File logging disabled due to initialization failure');
+                return;
+              }
+              log('✅ File logging initialized successfully with isolate');
+            } else {
+              // Usar operações diretas na thread principal
+              _directFileManager = _LogFileManager(
+                filePath: logFilePath,
+                saveAllLogs: config.saveAllLogs,
+                logRetentionPeriod: config.logRetentionPeriod,
+                maxFileSize: config.maxFileSize,
+              );
+              await _directFileManager!.initialize();
+              log('✅ File logging initialized successfully without isolate');
+            }
+
+            _isInitialized = true;
+          } catch (e, stack) {
+            log('❌ Critical error in file logging initialization: $e');
+            log('Stack: $stack');
+            _isInitialized = false;
+            log('⚠️ File logging disabled due to critical error');
+            // NÃO fazer rethrow para evitar crash do app
           }
-
-          _isInitialized = true;
         } else {
           log('⚠️ TalkerPersistentHistory já está inicializado');
         }
@@ -570,10 +844,13 @@ class TalkerPersistentHistory implements TalkerHistory {
         }
       }
     } catch (e, stack) {
-      log('❌ Error initializing log file:');
+      log('❌ CRITICAL: Error in _initialize():');
       log('Error: $e');
       log('Stack: $stack');
-      rethrow;
+      _isInitialized = false;
+      log('⚠️ File logging completely disabled due to critical initialization error');
+      // NÃO fazer rethrow aqui para evitar crash do app
+      // É melhor o app continuar funcionando sem logging do que crashar
     }
   }
 
@@ -597,13 +874,25 @@ class TalkerPersistentHistory implements TalkerHistory {
     if (!config.enableFileLogging || config.saveAllLogs) return;
 
     try {
-      final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
-        type: FileOperationType.read,
-        logName: logName,
-      ));
+      String? content;
 
-      if (response.success && response.content != null) {
-        final content = response.content!;
+      if (config.useIsolate) {
+        final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
+          type: FileOperationType.read,
+          logName: logName,
+        ));
+
+        if (response.success && response.content != null) {
+          content = response.content!;
+        }
+      } else {
+        // Usar leitura direta
+        if (_directFileManager != null) {
+          content = await _directFileManager!.read();
+        }
+      }
+
+      if (content != null) {
         final logCount = '┌'.allMatches(content).length;
 
         if (logCount > config.maxCapacity) {
@@ -630,12 +919,16 @@ class TalkerPersistentHistory implements TalkerHistory {
           final skipCount = math.max(0, logs.length - config.maxCapacity);
           final keepLogs = logs.skip(skipCount).toList();
 
-          await _IsolateManager.instance.sendMessage(FileOperationMessage(
-            type: FileOperationType.write,
-            logs: keepLogs,
-            maxCapacity: config.maxCapacity,
-            logName: logName,
-          ));
+          if (config.useIsolate) {
+            await _IsolateManager.instance.sendMessage(FileOperationMessage(
+              type: FileOperationType.write,
+              logs: keepLogs,
+              maxCapacity: config.maxCapacity,
+              logName: logName,
+            ));
+          } else {
+            await _directFileManager!.write(keepLogs);
+          }
 
           log('📊 Log file rotated - new log count: $logCount');
         }
@@ -651,23 +944,61 @@ class TalkerPersistentHistory implements TalkerHistory {
   Future<void> _flushBuffer() async {
     if (_writeBuffer.isEmpty || !_isInitialized || !config.enableFileLogging) return;
 
+    // Criar cópia do buffer para evitar modificações concorrentes
+    List<String> bufferCopy;
     try {
-      final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
-        type: FileOperationType.write,
-        logs: _writeBuffer,
-        maxCapacity: config.saveAllLogs ? null : config.maxCapacity,
-        logName: logName,
-      ));
+      bufferCopy = List.from(_writeBuffer);
+    } catch (e) {
+      log('❌ Error copying buffer, clearing it: $e');
+      _writeBuffer.clear();
+      return;
+    }
 
-      if (!response.success) {
-        throw Exception(response.error);
+    try {
+      if (config.useIsolate) {
+        // Usar isolate para escrita
+        final response = await _IsolateManager.instance.sendMessage(FileOperationMessage(
+          type: FileOperationType.write,
+          logs: bufferCopy,
+          maxCapacity: config.saveAllLogs ? null : config.maxCapacity,
+          logName: logName,
+        ));
+
+        if (!response.success) {
+          log('❌ Isolate write failed: ${response.error}');
+          // NÃO fazer throw - apenas logar o erro
+
+          // Se buffer está muito grande, limpar para evitar memory leak
+          if (_writeBuffer.length > 500) {
+            log('⚠️ Clearing oversized buffer to prevent memory leak');
+            _writeBuffer.clear();
+          }
+          return;
+        }
+      } else {
+        // Usar escrita direta na thread principal
+        if (_directFileManager != null) {
+          await _directFileManager!.write(bufferCopy);
+        } else {
+          log('❌ Direct file manager not initialized');
+          return;
+        }
       }
 
+      // Só limpar buffer se escrita foi bem-sucedida
       _writeBuffer.clear();
     } catch (e, stack) {
-      log('❌ Error writing to log file:');
+      log('❌ CRITICAL: Error in _flushBuffer():');
       log('Error: $e');
       log('Stack: $stack');
+
+      // Emergency buffer clear para evitar memory leak
+      if (_writeBuffer.length > 1000) {
+        log('🚨 EMERGENCY: Clearing oversized buffer to prevent crash');
+        _writeBuffer.clear();
+      }
+
+      // NÃO fazer rethrow - é melhor perder logs do que crashar
     }
   }
 
@@ -852,9 +1183,21 @@ class TalkerPersistentHistory implements TalkerHistory {
           }
         }
       } catch (e, stack) {
-        log('❌ Error adding log to buffer:');
+        log('❌ CRITICAL: Error in write() method:');
         log('Error: $e');
         log('Stack: $stack');
+
+        // Tentar recovery - desabilitar file logging se houver muitos erros
+        try {
+          if (_writeBuffer.length > 1000) {
+            log('⚠️ Buffer overflow detected, clearing buffer to prevent memory leak');
+            _writeBuffer.clear();
+          }
+        } catch (bufferError) {
+          log('❌ Error clearing buffer: $bufferError');
+        }
+
+        // NÃO fazer rethrow - é melhor perder alguns logs do que crashar o app
       }
     }
   }
@@ -882,10 +1225,18 @@ class TalkerPersistentHistory implements TalkerHistory {
         await _flushBuffer();
       }
 
-      await _IsolateManager.instance.sendMessage(FileOperationMessage(
-        type: FileOperationType.dispose,
-        logName: logName,
-      ));
+      if (config.useIsolate) {
+        await _IsolateManager.instance.sendMessage(FileOperationMessage(
+          type: FileOperationType.dispose,
+          logName: logName,
+        ));
+      } else {
+        // Dispose do direct file manager
+        if (_directFileManager != null) {
+          await _directFileManager!.dispose();
+          _directFileManager = null;
+        }
+      }
 
       _isInitialized = false;
     }
@@ -903,5 +1254,12 @@ class TalkerPersistentHistory implements TalkerHistory {
     }
 
     log('✅ TalkerPersistentHistory finalized');
+  }
+
+  /// Dispose global do isolate singleton - deve ser chamado no shutdown do app
+  static Future<void> disposeGlobalIsolate() async {
+    log('🔄 Disposing global isolate manager...');
+    _IsolateManager.instance.dispose();
+    log('✅ Global isolate manager disposed');
   }
 }

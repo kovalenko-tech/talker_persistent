@@ -207,6 +207,73 @@ final history = await TalkerPersistentHistory.create(
 - ✅ Configurable size limit
 - ✅ Preserves log integrity
 
+## Configuração
+
+A classe `TalkerPersistentConfig` permite configurar o comportamento do logging:
+
+```dart
+final config = TalkerPersistentConfig(
+  bufferSize: 100,           // Tamanho do buffer (0 = real-time)
+  flushOnError: true,        // Flush imediato em erros críticos
+  maxCapacity: 1000,         // Capacidade máxima do log
+  enableFileLogging: true,   // Habilitar logging em arquivo
+  enableHiveLogging: true,   // Habilitar logging no Hive
+  saveAllLogs: false,        // Salvar todos os logs ou rotacionar
+  logRetentionPeriod: LogRetentionPeriod.threeDays, // Período de retenção
+  maxFileSize: 5 * 1024 * 1024, // Tamanho máximo do arquivo (5MB)
+  useIsolate: true,          // Usar isolate para operações de arquivo (padrão: true)
+);
+```
+
+### Parâmetro `useIsolate`
+
+O parâmetro `useIsolate` permite controlar se as operações de arquivo devem ser executadas em um isolate separado ou na thread principal:
+
+- **`useIsolate: true`** (padrão): Usa isolate para operações de arquivo
+  - ✅ Não bloqueia a UI
+  - ✅ Melhor performance em aplicações grandes
+  - ✅ Recomendado para aplicações Flutter
+
+- **`useIsolate: false`**: Executa operações na thread principal
+  - ✅ Menor overhead de memória
+  - ✅ Mais simples para depuração
+  - ✅ Recomendado para aplicações Dart puras ou casos específicos
+
+```dart
+// Exemplo sem isolate (thread principal)
+final historyWithoutIsolate = await TalkerPersistentHistory.create(
+  logName: 'app_logs',
+  savePath: '/path/to/logs',
+  config: TalkerPersistentConfig(
+    useIsolate: false, // ← Desabilita o uso de isolate
+  ),
+);
+
+// Exemplo com isolate (padrão)
+final historyWithIsolate = await TalkerPersistentHistory.create(
+  logName: 'app_logs',
+  savePath: '/path/to/logs',
+  config: TalkerPersistentConfig(
+    useIsolate: true, // ← Usa isolate (padrão)
+  ),
+);
+```
+
+### Quando usar cada opção?
+
+**Use `useIsolate: true` quando:**
+- Aplicação Flutter com interface de usuário
+- Volume alto de logs
+- Performance da UI é crítica
+- Operações de arquivo podem ser demoradas
+
+**Use `useIsolate: false` quando:**
+- Aplicação Dart pura (sem UI)
+- Volume baixo de logs
+- Problemas específicos com isolates
+- Necessidade de menor uso de memória
+- Depuração de problemas de logging
+
 ## Examples
 
 See the `example/` directory for complete working examples:
