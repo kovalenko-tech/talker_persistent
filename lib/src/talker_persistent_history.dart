@@ -122,21 +122,17 @@ class _IsolateManager {
               completer.complete(response);
             }
           }
-        } catch (e, stack) {
-          log('❌ Error in isolate response listener: $e');
-          log('Stack: $stack');
+        } catch (e) {
           // Se houver erro no parsing da mensagem, tentar limpar requisições órfãs
           _cleanupOrphanedRequests();
         }
-      }, onError: (error, stack) {
-        log('❌ Error in isolate response stream: $error');
-        log('Stack: $stack');
+      }, onError: (error) {
         _cleanupOrphanedRequests();
       });
 
       _isInitialized = true;
       _initializationCompleter!.complete();
-    } catch (e, stack) {
+    } catch (e) {
       // Reset state em caso de falha
       _isInitialized = false;
       _isolate?.kill();
@@ -150,8 +146,6 @@ class _IsolateManager {
       _initializationCompleter!.completeError(e);
       _initializationCompleter = null;
 
-      log('❌ Failed to initialize isolate: $e');
-      log('Stack: $stack');
       throw Exception('Failed to initialize isolate: $e');
     }
   }
@@ -192,16 +186,13 @@ class _IsolateManager {
         Duration(seconds: 30),
         onTimeout: () {
           _pendingRequests.remove(requestId);
-          log('⚠️ Isolate response timeout for request: $requestId');
           return FileOperationResponse(
             success: false,
             error: 'Isolate response timeout',
           );
         },
       );
-    } catch (e, stack) {
-      log('❌ Error sending message to isolate: $e');
-      log('Stack: $stack');
+    } catch (e) {
       return FileOperationResponse(
         success: false,
         error: 'Failed to send message to isolate: $e',
@@ -229,13 +220,10 @@ class _IsolateManager {
       _pendingRequests.remove(key);
     }
 
-    if (orphanedKeys.isNotEmpty) {
-      log('🧹 Cleaned up ${orphanedKeys.length} orphaned requests');
-    }
+    if (orphanedKeys.isNotEmpty) {}
 
     // Se há muitas requisições pendentes, pode indicar problemas no isolate
     if (_pendingRequests.length > 50) {
-      log('🚨 WARNING: Too many pending requests (${_pendingRequests.length}), isolate may be stuck');
       _forceResetIsolate();
     }
   }
@@ -243,8 +231,6 @@ class _IsolateManager {
   /// Reset forçado do isolate em caso de problemas críticos
   void _forceResetIsolate() {
     try {
-      log('🔄 Force resetting isolate due to critical issues...');
-
       // Completar todas as requisições pendentes com erro
       for (final completer in _pendingRequests.values) {
         if (!completer.isCompleted) {
@@ -265,11 +251,8 @@ class _IsolateManager {
       _responsePort = null;
       _isInitialized = false;
       _initializationCompleter = null;
-
-      log('✅ Isolate force reset completed');
-    } catch (e, stack) {
-      log('❌ Error during force reset: $e');
-      log('Stack: $stack');
+    } catch (e) {
+      log(e.toString(), name: 'TalkerPersistentHistory');
     }
   }
 
@@ -305,14 +288,12 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
 
       try {
         if (message is! Map<String, dynamic>) {
-          print('❌ Invalid message type received in isolate: ${message.runtimeType}');
           continue;
         }
 
         // SAFE CASTING: Verificar cada campo antes de fazer cast
         requestId = message['requestId']?.toString();
         if (requestId == null || requestId.isEmpty) {
-          print('❌ Missing or invalid requestId in isolate message');
           continue;
         }
 
@@ -334,7 +315,6 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
           }
         }
 
-        final maxCapacity = message['maxCapacity'] as int?;
         final saveAllLogs = message['saveAllLogs'] as bool?;
 
         // Safe casting para logRetentionPeriod
@@ -404,10 +384,7 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
             'content': response.content,
           });
         }
-      } catch (e, stack) {
-        print('❌ ISOLATE ERROR: $e');
-        print('Stack: $stack');
-
+      } catch (e) {
         // Tentar responder com o erro, mas de forma segura
         try {
           if (responsePort != null && requestId != null) {
@@ -418,14 +395,12 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
             });
           }
         } catch (sendError) {
-          print('❌ Failed to send error response: $sendError');
+          log(sendError.toString(), name: 'TalkerPersistentHistory');
         }
       }
     }
-  } catch (globalError, globalStack) {
+  } catch (globalError) {
     // PROTEÇÃO GLOBAL: Se qualquer coisa falhar no isolate, capturar aqui
-    print('❌ CRITICAL ISOLATE ERROR: $globalError');
-    print('Global Stack: $globalStack');
 
     // Tentar notificar o erro de volta, mas não crashar se falhar
     try {
@@ -434,7 +409,7 @@ Future<void> _fileOperationsIsolate(SendPort sendPort) async {
         'error': 'Critical isolate failure: $globalError',
       });
     } catch (criticalError) {
-      print('❌ CRITICAL: Cannot send isolate error notification: $criticalError');
+      log(criticalError.toString(), name: 'TalkerPersistentHistory');
     }
   }
 }
@@ -489,7 +464,6 @@ class _LogFileManager {
       try {
         await logFile!.parent.create(recursive: true);
       } catch (e) {
-        print('⚠️ Warning: Could not create parent directory: $e');
         // Continuar mesmo se falhar, pode ser que já exista
       }
 
@@ -499,7 +473,6 @@ class _LogFileManager {
           final content = await logFile!.readAsString();
           currentLogCount = '┌'.allMatches(content).length;
         } catch (e) {
-          print('⚠️ Warning: Could not read existing log file, starting fresh: $e');
           currentLogCount = 0;
         }
       } else {
@@ -507,13 +480,10 @@ class _LogFileManager {
           await logFile!.writeAsString('');
           currentLogCount = 0;
         } catch (e) {
-          print('⚠️ Warning: Could not create initial log file: $e');
           currentLogCount = 0;
         }
       }
-    } catch (e, stack) {
-      print('❌ CRITICAL: LogFileManager initialization failed: $e');
-      print('Stack: $stack');
+    } catch (e) {
       rethrow;
     }
   }
@@ -573,7 +543,6 @@ class _LogFileManager {
   Future<void> write(List<String> logs) async {
     try {
       if (logFile == null || logs.isEmpty) {
-        print('⚠️ Warning: Cannot write - logFile is null or logs are empty');
         return;
       }
 
@@ -593,7 +562,6 @@ class _LogFileManager {
             await deleteOldFiles();
           }
         } catch (e) {
-          print('⚠️ Warning: Error in date rotation: $e');
           // Continuar com o arquivo atual
         }
       }
@@ -611,7 +579,6 @@ class _LogFileManager {
             }
           }
         } catch (e) {
-          print('⚠️ Warning: Error checking file size for rotation: $e');
           // Continuar sem rotação
         }
       }
@@ -621,22 +588,16 @@ class _LogFileManager {
         await logFile!.writeAsString(content, mode: FileMode.append);
         currentLogCount += newLogCount;
       } catch (e) {
-        print('❌ CRITICAL: Failed to write to log file: $e');
-
         // Tentar recovery - criar novo arquivo se necessário
         try {
           await logFile!.parent.create(recursive: true);
           await logFile!.writeAsString(content, mode: FileMode.write);
           currentLogCount = newLogCount;
-          print('✅ Recovery successful - created new log file');
         } catch (recoveryError) {
-          print('❌ CRITICAL: Recovery also failed: $recoveryError');
           throw Exception('Failed to write log and recovery failed: $e -> $recoveryError');
         }
       }
-    } catch (e, stack) {
-      print('❌ CRITICAL: LogFileManager.write() failed completely: $e');
-      print('Stack: $stack');
+    } catch (e) {
       // NÃO fazer rethrow aqui para evitar crash do isolate
       // O erro já foi logado, melhor continuar funcionando
     }
@@ -679,10 +640,8 @@ class _LogFileManager {
 
       // Atualiza o contador de logs
       currentLogCount = '┌'.allMatches(newContent).length;
-
-      print('📊 Arquivo rotacionado - removidos ${logs.length - keepCount} logs antigos, mantidos $keepCount logs recentes');
     } catch (e) {
-      print('❌ Erro ao rotacionar arquivo por tamanho: $e');
+      log(e.toString(), name: 'TalkerPersistentHistory');
     }
   }
 
@@ -783,13 +742,6 @@ class TalkerPersistentHistory implements TalkerHistory {
     try {
       if (savePath != null && config.enableFileLogging) {
         final logFilePath = path.join(savePath!, '$logName.$_extension');
-        log('📝 Initializing log file at: $logFilePath');
-        log('📊 Buffer size: ${config.bufferSize} (${config.bufferSize == 0 ? 'real-time' : 'buffered'})');
-        log('🚨 Flush on error: ${config.flushOnError}');
-        log('💾 Max capacity: ${config.maxCapacity}');
-        log('📅 Save all logs: ${config.saveAllLogs}');
-        log('📏 Max file size: ${(config.maxFileSize / (1024 * 1024)).toStringAsFixed(1)}MB');
-        log('🔧 Use isolate: ${config.useIsolate}');
 
         if (!_isInitialized) {
           try {
@@ -805,13 +757,10 @@ class TalkerPersistentHistory implements TalkerHistory {
               ));
 
               if (!response.success) {
-                log('❌ Isolate initialization failed: ${response.error}');
                 // NÃO fazer throw aqui, apenas desabilitar file logging
                 _isInitialized = false;
-                log('⚠️ File logging disabled due to initialization failure');
                 return;
               }
-              log('✅ File logging initialized successfully with isolate');
             } else {
               // Usar operações diretas na thread principal
               _directFileManager = _LogFileManager(
@@ -821,34 +770,20 @@ class TalkerPersistentHistory implements TalkerHistory {
                 maxFileSize: config.maxFileSize,
               );
               await _directFileManager!.initialize();
-              log('✅ File logging initialized successfully without isolate');
             }
 
             _isInitialized = true;
-          } catch (e, stack) {
-            log('❌ Critical error in file logging initialization: $e');
-            log('Stack: $stack');
+          } catch (e) {
             _isInitialized = false;
-            log('⚠️ File logging disabled due to critical error');
             // NÃO fazer rethrow para evitar crash do app
           }
-        } else {
-          log('⚠️ TalkerPersistentHistory já está inicializado');
-        }
+        } else {}
       } else {
-        if (savePath == null) {
-          log('⚠️ savePath is null, file logging disabled');
-        }
-        if (!config.enableFileLogging) {
-          log('⚠️ File logging disabled in config');
-        }
+        if (savePath == null) {}
+        if (!config.enableFileLogging) {}
       }
-    } catch (e, stack) {
-      log('❌ CRITICAL: Error in _initialize():');
-      log('Error: $e');
-      log('Stack: $stack');
+    } catch (e) {
       _isInitialized = false;
-      log('⚠️ File logging completely disabled due to critical initialization error');
       // NÃO fazer rethrow aqui para evitar crash do app
       // É melhor o app continuar funcionando sem logging do que crashar
     }
@@ -929,14 +864,10 @@ class TalkerPersistentHistory implements TalkerHistory {
           } else {
             await _directFileManager!.write(keepLogs);
           }
-
-          log('📊 Log file rotated - new log count: $logCount');
         }
       }
-    } catch (e, stack) {
-      log('❌ Error rotating log file:');
-      log('Error: $e');
-      log('Stack: $stack');
+    } catch (e) {
+      log(e.toString(), name: 'TalkerPersistentHistory');
     }
   }
 
@@ -949,7 +880,6 @@ class TalkerPersistentHistory implements TalkerHistory {
     try {
       bufferCopy = List.from(_writeBuffer);
     } catch (e) {
-      log('❌ Error copying buffer, clearing it: $e');
       _writeBuffer.clear();
       return;
     }
@@ -965,12 +895,10 @@ class TalkerPersistentHistory implements TalkerHistory {
         ));
 
         if (!response.success) {
-          log('❌ Isolate write failed: ${response.error}');
           // NÃO fazer throw - apenas logar o erro
 
           // Se buffer está muito grande, limpar para evitar memory leak
           if (_writeBuffer.length > 500) {
-            log('⚠️ Clearing oversized buffer to prevent memory leak');
             _writeBuffer.clear();
           }
           return;
@@ -980,21 +908,15 @@ class TalkerPersistentHistory implements TalkerHistory {
         if (_directFileManager != null) {
           await _directFileManager!.write(bufferCopy);
         } else {
-          log('❌ Direct file manager not initialized');
           return;
         }
       }
 
       // Só limpar buffer se escrita foi bem-sucedida
       _writeBuffer.clear();
-    } catch (e, stack) {
-      log('❌ CRITICAL: Error in _flushBuffer():');
-      log('Error: $e');
-      log('Stack: $stack');
-
+    } catch (e) {
       // Emergency buffer clear para evitar memory leak
       if (_writeBuffer.length > 1000) {
-        log('🚨 EMERGENCY: Clearing oversized buffer to prevent crash');
         _writeBuffer.clear();
       }
 
@@ -1144,24 +1066,20 @@ class TalkerPersistentHistory implements TalkerHistory {
             // Para respostas, mostrar apenas [RESPONSE]: com os dados
             if (body.isNotEmpty && body != msg) {
               final responseLog = '$timestamp [$level] [RESPONSE]: $body';
-              log('📝 Adding response log to buffer: ${responseLog.substring(0, math.min(50, responseLog.length))}...');
               _writeBuffer.add(responseLog);
             } else {
               // Se não tem body, mostrar como resposta normal
               final responseLog = '$timestamp [$level] [RESPONSE] $msg';
-              log('📝 Adding response log to buffer: ${responseLog.substring(0, math.min(50, responseLog.length))}...');
               _writeBuffer.add(responseLog);
             }
           } else {
             // Para requisições, mostrar [REQUEST] com a URL
             final requestLog = '$timestamp [$level] [REQUEST] $msg';
-            log('📝 Adding request log to buffer: ${requestLog.substring(0, math.min(50, requestLog.length))}...');
             _writeBuffer.add(requestLog);
           }
         } else {
           // Log normal (não HTTP)
           final formattedLog = formatLogSimple(data);
-          log('📝 Adding log to buffer: ${formattedLog.substring(0, math.min(50, formattedLog.length))}...');
           _writeBuffer.add(formattedLog);
         }
 
@@ -1171,30 +1089,19 @@ class TalkerPersistentHistory implements TalkerHistory {
             _writeBuffer.length >= config.bufferSize; // Buffer full
 
         if (shouldFlush) {
-          final reason = config.bufferSize == 0
-              ? 'real-time mode'
-              : _shouldFlushImmediately(data)
-                  ? 'error/critical log'
-                  : 'buffer full';
-          log('🔄 Flushing buffer ($reason)');
           _flushBuffer();
           if (!config.saveAllLogs) {
             _rotateLogFile();
           }
         }
-      } catch (e, stack) {
-        log('❌ CRITICAL: Error in write() method:');
-        log('Error: $e');
-        log('Stack: $stack');
-
+      } catch (e) {
         // Tentar recovery - desabilitar file logging se houver muitos erros
         try {
           if (_writeBuffer.length > 1000) {
-            log('⚠️ Buffer overflow detected, clearing buffer to prevent memory leak');
             _writeBuffer.clear();
           }
         } catch (bufferError) {
-          log('❌ Error clearing buffer: $bufferError');
+          log(bufferError.toString(), name: 'TalkerPersistentHistory');
         }
 
         // NÃO fazer rethrow - é melhor perder alguns logs do que crashar o app
@@ -1217,11 +1124,8 @@ class TalkerPersistentHistory implements TalkerHistory {
 
   /// Disposes of the resources used by this instance.
   Future<void> dispose() async {
-    log('🔄 Finalizing TalkerPersistentHistory...');
-
     if (_isInitialized && config.enableFileLogging) {
       if (_writeBuffer.isNotEmpty) {
-        log('📝 Writing remaining ${_writeBuffer.length} logs from buffer');
         await _flushBuffer();
       }
 
@@ -1245,21 +1149,14 @@ class TalkerPersistentHistory implements TalkerHistory {
     if (config.enableHiveLogging) {
       try {
         await Hive.close();
-        log('✅ Hive fechado com sucesso');
-      } catch (e, stack) {
-        log('❌ Erro ao fechar o Hive:');
-        log('Error: $e');
-        log('Stack: $stack');
+      } catch (e) {
+        log(e.toString(), name: 'TalkerPersistentHistory');
       }
     }
-
-    log('✅ TalkerPersistentHistory finalized');
   }
 
   /// Dispose global do isolate singleton - deve ser chamado no shutdown do app
   static Future<void> disposeGlobalIsolate() async {
-    log('🔄 Disposing global isolate manager...');
     _IsolateManager.instance.dispose();
-    log('✅ Global isolate manager disposed');
   }
 }
