@@ -3,6 +3,14 @@
 import 'dart:convert';
 import 'package:talker/talker.dart';
 
+class _HttpLogTypes {
+  static const String httpError = 'HTTP Error';
+  static const String httpRequest = 'HTTP Request';
+  static const String httpResponse = 'HTTP Response';
+
+  static const List<String> all = [httpError, httpRequest, httpResponse];
+}
+
 extension PrettyTalker on TalkerData {
   String toPrettyString() {
     final buffer = StringBuffer();
@@ -32,7 +40,8 @@ extension PrettyTalker on TalkerData {
 
     // Tipo de erro e mensagem
     if (exception != null || error != null) {
-      final type = exception?.runtimeType.toString() ?? error?.runtimeType.toString();
+      final type =
+          exception?.runtimeType.toString() ?? error?.runtimeType.toString();
       final msg = exception?.toString() ?? error?.toString();
       buffer.writeln('│');
       buffer.writeln('│ Type: $type');
@@ -57,11 +66,7 @@ extension PrettyTalker on TalkerData {
 
   // Utilitário para verificar se o log é HTTP
   bool _isHttpLog() {
-    return [
-      TalkerLogType.httpError.key,
-      TalkerLogType.httpRequest.key,
-      TalkerLogType.httpResponse.key,
-    ].contains(title);
+    return _HttpLogTypes.all.contains(title);
   }
 
   // Divide linhas muito longas em partes menores para caber na largura
